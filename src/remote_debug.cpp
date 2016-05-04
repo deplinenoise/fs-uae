@@ -5,6 +5,7 @@
 //
 // (c) 1995 Bernd Schmidt
 // (c) 2006 Toni Wilen
+// (c) 2016 Daniel Collin (this file: GDB Implementation/remote debugger interface)
 //
 // This implementation is done from scratch and doesn't use any existing gdb-stub code. 
 // The idea is to supply a fairly minimal implementation in order to reduce maintaince.
@@ -12,14 +13,53 @@
 // This is what according to the GDB protocol dock over here https://sourceware.org/gdb/current/onlinedocs/gdb/Overview.html
 // is required of a stub:
 //
+// "At a minimum, a stub is required to support the 'g' and 'G' commands for register access, and the 'm' and 'M' commands for memory access. 
+// Stubs that only control single-threaded targets can implement run control with the 'c' (continue), and 's' (step) commands. 
+// Stubs that support multi-threading targets should support the 'vCont' command.
 //
 // All other commands are optional."
 //
+// This stub implements a set of extensions that isn't really used by GDB but makes sense in terms of Amiga. 
 // Some of these are copper debugging, blitter, dma, custom chipset stats, etc
 //
 // TODO: List and implement extensions
 //
 
+#include "remote_debug.h"
+#ifdef REMOTE_DEBUGGER
+
+#include <string.h>
+#include <stdint.h>
+#if defined(_MSC_VER)
+#pragma warning(disable: 4496)
+#include <winsock2.h>
+#pragma warning(default: 4496)
+#include <winsock2.h>
+#include <Ws2tcpip.h>
+#endif
+
+#if !defined(_WIN32)
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#endif
+
+#if defined(__linux__)
+#include <sys/time.h>
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+
+#include "defines.h"
+#include "debug.h"
+#include "newcpu.h"
+#include "custom.h"
 
 #ifndef INVALID_SOCKET
 #define INVALID_SOCKET -1

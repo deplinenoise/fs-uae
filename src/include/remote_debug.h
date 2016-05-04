@@ -5,11 +5,13 @@
   *
   * (c) 1995 Bernd Schmidt
   * 
+  * Remote debugger code (c) 2016 Daniel Collin.
   */
 
 #ifndef UAE_REMOTE_DEBUG_H
 #define UAE_REMOTE_DEBUG_H
 
+//#define REMOTE_DEBUGGER
 
 #ifdef REMOTE_DEBUGGER
 
