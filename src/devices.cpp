@@ -124,6 +124,9 @@ void devices_vsync_pre(void)
 #ifdef WITH_X86
 	x86_bridge_vsync();
 #endif
+#ifdef REMOTE_DEBUGGER
+	remote_debug_update ();
+#endif
 }
 
 void devices_vsync_post(void)
