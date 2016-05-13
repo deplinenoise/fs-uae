@@ -31,6 +31,7 @@
 #include "plugins.h"
 #include "options.h"
 #include "paths.h"
+#include "remote_debug.h"
 #include "config-drives.h"
 #ifdef WITH_CEF
 #include <fs/emu/cef.h>

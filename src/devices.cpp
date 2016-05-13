@@ -60,6 +60,7 @@
 #include "ethernet.h"
 #include "uae/debuginfo.h"
 #include "uae/segtracker.h"
+#include "remote_debug.h"
 #ifdef RETROPLATFORM
 #include "rp.h"
 #endif

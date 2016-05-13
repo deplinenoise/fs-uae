@@ -348,8 +348,12 @@ static void remote_debug_init_ (int time_out)
 	if (s_conn || time_out < 0) 
 		return;
 
+	printf("creating connection...\n");
+
 	if (!(s_conn = rconn_create (ConnectionType_Listener, 6860)))
 		return;
+
+	printf("remote debugger active\n");
 
 	remote_debugging = 1;
 
@@ -921,10 +925,20 @@ static bool parse_packet(char* packet, int size)
 	return handle_packet(&packet[start + 1], size - 1);
 }
 
+static int try_boot = 0;
+
+extern void debugger_boot();
+
 // Main function that will be called when doing the actual debugging
 
 static void remote_debug_ (void)
 {
+	if (!try_boot) {
+		printf("debugger boot\n");
+		debugger_boot();
+		try_boot = 1;
+	}
+
 	// send exception
 
 	send_exception();
@@ -932,9 +946,7 @@ static void remote_debug_ (void)
 	while (1)
 	{
 		if (rconn_poll_read(s_conn)) {
-			char temp[1024];
-
-			memset(temp, 0, sizeof(temp));
+			char temp[1024] = { 0 };
 
 			int size = rconn_recv(s_conn, temp, sizeof(temp), 0);
 
@@ -970,6 +982,25 @@ static void remote_debug_update_ (void)
 		activate_debugger ();
 }
 
+// Called from debugger_helper. At this point CreateProcess has been called
+// and we are resposible for filling out the data needed by the "RunCommand"
+// that looks like this:
+//
+//    rc = RunCommand(seglist, stacksize, argptr, argsize)
+//    D0                D1         D2       D3      D4
+//
+//    LONG RunCommand(BPTR, ULONG, STRPTR, ULONG)
+// 
+void remote_debug_start_executable (struct TrapContext *context)
+{
+	m68k_dreg (regs, 1) = 0;
+	printf("remote_debug_start_executable\n");
+}
+
+void remote_debug_end_executable (struct TrapContext *context)
+{
+	printf("remote_debug_end_executable\n");
+}
 
 //
 // These are just wrappers to expose the code to C from C++

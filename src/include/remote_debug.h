@@ -11,13 +11,16 @@
 #ifndef UAE_REMOTE_DEBUG_H
 #define UAE_REMOTE_DEBUG_H
 
-//#define REMOTE_DEBUGGER
+#define REMOTE_DEBUGGER
 
 #ifdef REMOTE_DEBUGGER
+
+struct TrapContext;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 
 //
 // Set to 1 if remote debugging is enabled otherwise 0
@@ -41,9 +44,14 @@ void remote_debug (void);
 
 void remote_debug_update (void);
 
+// 
+
 #ifdef __cplusplus
 }
 #endif
+
+void remote_debug_start_executable (struct TrapContext *context);
+void remote_debug_end_executable (struct TrapContext *context);
 
 #endif // REMOTE_DEBUGGER
 

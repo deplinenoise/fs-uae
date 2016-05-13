@@ -67,6 +67,7 @@
 #include "cpuboard.h"
 #include "rommgr.h"
 #include "debug.h"
+#include "remote_debug.h"
 #ifdef RETROPLATFORM
 #include "rp.h"
 #endif
@@ -1811,12 +1812,18 @@ static uae_u32 REGPARAM2 debugger_helper(TrapContext *context)
 	switch (mode)
 	{
 		case 1:
+#ifdef REMOTE_DEBUGGER 
+		remote_debug_start_executable(context);
+#endif
 		// Execute debugger_boot() to get here.
 		write_log(_T("debugger #1\n"));
 		// return RunCommand(() parameters
 		// does nothing if D1 == 0.
 		break;
 		case 2:
+#ifdef REMOTE_DEBUGGER 
+		remote_debug_end_executable(context);
+#endif
 		// called when RunCommand() returns
 		// D0 = RunCommand() return code.
 		write_log(_T("debugger #2\n"));
@@ -1828,12 +1835,15 @@ static uae_u32 REGPARAM2 debugger_helper(TrapContext *context)
 	return 1;
 }
 
-static void debugger_boot(void)
+void debugger_boot(void)
 {
 	Unit *u;
+	printf("starting debugger boot units: %p\n", units);
 	for (u = units; u; u = u->next) {
+		printf("looping devs %p\n", u);
 		if (is_virtual(u->unit) && filesys_isvolume(u)) {
 			put_byte(u->volume + 173 - 32, get_byte(u->volume + 173 - 32) | 2);
+			printf("signal!\n");
 			uae_Signal(get_long(u->volume + 176 - 32), 1 << 13);
 			break;
 		}
@@ -2991,6 +3001,8 @@ static Unit *startup_create_unit (UnitInfo *uinfo, int num)
 	int i;
 	Unit *unit, *u;
 
+	printf("creating startup unit\n");
+
 	unit = xcalloc (Unit, 1);
 	/* keep list in insertion order */
 	u = units;
@@ -3140,6 +3152,8 @@ static uae_u32 REGPARAM2 startup_handler (TrapContext *context)
 	uae_u64 uniq = 0;
 	uae_u32 cdays;
 	struct mytimeval ctime = { 0 };
+
+	printf("startup_handler\n");
 
 	// 1.3:
 	// dp_Arg1 contains crap (Should be name of device)
