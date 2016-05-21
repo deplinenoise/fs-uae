@@ -7,19 +7,19 @@
 // (c) 2006 Toni Wilen
 // (c) 2016 Daniel Collin (this file: GDB Implementation/remote debugger interface)
 //
-// This implementation is done from scratch and doesn't use any existing gdb-stub code. 
+// This implementation is done from scratch and doesn't use any existing gdb-stub code.
 // The idea is to supply a fairly minimal implementation in order to reduce maintaince.
 //
 // This is what according to the GDB protocol dock over here https://sourceware.org/gdb/current/onlinedocs/gdb/Overview.html
 // is required of a stub:
 //
-// "At a minimum, a stub is required to support the 'g' and 'G' commands for register access, and the 'm' and 'M' commands for memory access. 
-// Stubs that only control single-threaded targets can implement run control with the 'c' (continue), and 's' (step) commands. 
+// "At a minimum, a stub is required to support the 'g' and 'G' commands for register access, and the 'm' and 'M' commands for memory access.
+// Stubs that only control single-threaded targets can implement run control with the 'c' (continue), and 's' (step) commands.
 // Stubs that support multi-threading targets should support the 'vCont' command.
 //
 // All other commands are optional."
 //
-// This stub implements a set of extensions that isn't really used by GDB but makes sense in terms of Amiga. 
+// This stub implements a set of extensions that isn't really used by GDB but makes sense in terms of Amiga.
 // Some of these are copper debugging, blitter, dma, custom chipset stats, etc
 //
 // TODO: List and implement extensions
@@ -74,6 +74,7 @@
 //
 
 static bool step_cpu = false;
+static bool did_step_cpu = false;
 static uae_u8 s_lastSent[1024];
 static int s_lastSize = 0;
 
@@ -308,7 +309,7 @@ static int rconn_send(rconn* conn, const void* buffer, int length, int flags)
 	char* c = (char*)buffer;
 
 	for (int i = 0; i < length; ++i)
-		printf("%c", c[i]); 
+		printf("%c", c[i]);
 
 	printf("\n");
 #endif
@@ -337,15 +338,15 @@ static int rconn_poll_read(rconn* conn)
 
 static rconn* s_conn = 0;
 
-// 
-// time_out allows to set the time UAE will wait at startup for a connection. 
+//
+// time_out allows to set the time UAE will wait at startup for a connection.
 // This is useful when wanting to debug things at early startup.
 // If this is zero no time-out is set and if -1 no remote connection will be setup
 //
 
 static void remote_debug_init_ (int time_out)
 {
-	if (s_conn || time_out < 0) 
+	if (s_conn || time_out < 0)
 		return;
 
 	printf("creating connection...\n");
@@ -359,7 +360,7 @@ static void remote_debug_init_ (int time_out)
 
 	// if time_out > 0 we wait that number of seconds for a connection to be made. If
 	// none has been done within the given time-frame we just continue
-	
+
 	for (int i = 0; i < time_out * 10; i++) {
 		rconn_update_listner (s_conn);
 
@@ -469,14 +470,20 @@ static bool send_packet_in_place (unsigned char* t, int length)
 {
 	uae_u8 cs = 0;
 
-	for (int i = 1; i < length; ++i)
+	// + 1 as we calculate the cs one byte into the stream
+	for (int i = 1; i < length+1; ++i) {
+		uae_u8 temp = t[i];
 		cs += t[i];
+	}
 
 	t[length + 1] = '#';
-	t[length + 2] = s_hexchars[cs >> 4]; 
-	t[length + 3] = s_hexchars[cs & 0xf]; 
+	t[length + 2] = s_hexchars[cs >> 4];
+	t[length + 3] = s_hexchars[cs & 0xf];
+	t[length + 4] = 0;
 
-	return rconn_send(s_conn, t, length + 4, 0) == length + 4; 
+	printf("[<----] %s\n", t);
+
+	return rconn_send(s_conn, t, length + 4, 0) == length + 4;
 }
 
 static void send_packet_string (const char* string)
@@ -494,22 +501,22 @@ static void send_packet_string (const char* string)
 	memcpy (t, string, len);
 
 	t[len + 0] = '#';
-	t[len + 1] = s_hexchars[cs >> 4]; 
-	t[len + 2] = s_hexchars[cs & 0xf]; 
-	t[len + 3] = 0; 
+	t[len + 1] = s_hexchars[cs >> 4];
+	t[len + 2] = s_hexchars[cs & 0xf];
+	t[len + 3] = 0;
 
-	rconn_send(s_conn, s, len + 4, 0); 
+	rconn_send(s_conn, s, len + 4, 0);
 
-	printf("sending packet %s\n", s);
+	printf("[<----] %s\n", s);
 
 	xfree(s);
 }
 
 static bool send_registers (void)
 {
-	uae_u8 registerBuffer[((18 * 4) + (8 * 8)) + (3 * 4) + 5]; // 16+2 regs + 8 (optional) FPU regs + 3 FPU control regs + space for tags
-	uae_u8* t = registerBuffer; 
-	uae_u8* buffer = registerBuffer; 
+	uae_u8 registerBuffer[((18 * 4) + (8 * 8)) + (3 * 4) + 5 + 1] = { 0 }; // 16+2 regs + 8 (optional) FPU regs + 3 FPU control regs + space for tags
+	uae_u8* t = registerBuffer;
+	uae_u8* buffer = registerBuffer;
 
 	*buffer++ = '$';
 
@@ -523,7 +530,7 @@ static bool send_registers (void)
 	buffer = write_reg_32 (buffer, m68k_getpc ());
 
 #ifdef FPUEMU
-	if (currprefs.fpu_model) 
+	if (currprefs.fpu_model)
 	{
 		for (int i = 0; i < 8; ++i)
 			buffer = write_reg_double (buffer, regs.fp[i].fp);
@@ -552,20 +559,20 @@ static bool send_memory (char* packet)
 		return false;
 	}
 
-	t = mem = xmalloc(uae_u8, (size * 2) + 6);
-	
+	t = mem = xmalloc(uae_u8, (size * 2) + 7);
+
 	*t++ = '$';
 
 	for (int i = 0; i < size; ++i)
 	{
 		uae_u8 v = '?';
 
-		if (safe_addr (address, 1)) 
+		if (safe_addr (address, 1))
 			v = get_byte (address);
 
 		t[0] = s_hexchars[v >> 4];
 		t[1] = s_hexchars[v & 0xf];
-		
+
 		address++; t += 2;
 	}
 
@@ -609,20 +616,20 @@ bool set_memory (char* packet, int packet_length)
 	packet += memory_start;
 
 	printf ("memory start %d - %s\n", memory_start, packet);
-	
-	for (int i = 0; i < size; ++i) 
+
+	for (int i = 0; i < size; ++i)
 	{
 		if (!safe_addr (address, 1)) {
 			send_packet_string ("E01");
 			return false;
 		}
-		
-		uae_u8 t = hex(packet[0]) << 4 | hex(packet[1]); 
+
+		uae_u8 t = hex(packet[0]) << 4 | hex(packet[1]);
 
 		printf("setting memory %x-%x [%x] to %x\n", packet[0], packet[1], t, address);
 		packet += 2;
 
-		put_byte (address++, t); 
+		put_byte (address++, t);
 	}
 
 	return reply_ok ();
@@ -660,25 +667,25 @@ static uae_u32 get_double (const uae_u8** data)
 
 	*data = temp;
 
-	return t.d; 
+	return t.d;
 }
 
 static bool set_registers (const uae_u8* data)
 {
 	// order of registers are assumed to be
-	// d0-d7, a0-a7, sr, pc [optional fp0-fp7, control, sr, iar) 
+	// d0-d7, a0-a7, sr, pc [optional fp0-fp7, control, sr, iar)
 
 	for (int i = 0; i < 8; ++i)
-		m68k_dreg (regs, i) = get_u32(&data); 
+		m68k_dreg (regs, i) = get_u32(&data);
 
 	for (int i = 0; i < 8; ++i)
-		m68k_areg (regs, i) = get_u32(&data); 
+		m68k_areg (regs, i) = get_u32(&data);
 
 	regs.sr = get_u32 (&data);
 	regs.pc = get_u32 (&data);
 
 #ifdef FPUEMU
-	if (currprefs.fpu_model) 
+	if (currprefs.fpu_model)
 	{
 		for (int i = 0; i < 8; ++i)
 			regs.fp[i].fp = get_double (&data);
@@ -725,20 +732,20 @@ static int map_68k_exception(int exception) {
 		default: sig = 7; // "software generated"
 	}
 
-	return sig; 
+	return sig;
 }
 
 
 static bool send_exception (void) {
 
-	unsigned char buffer[10];
+	unsigned char buffer[16] = { 0 };
 
 	int sig = map_68k_exception (regs.exception);
 
 	buffer[0] = '$';
 	buffer[1] = 'S';
-	buffer[2] = s_hexchars[(sig >> 4) & 0xf]; 
-	buffer[3] = s_hexchars[(sig) & 0xf]; 
+	buffer[2] = s_hexchars[(sig >> 4) & 0xf];
+	buffer[3] = s_hexchars[(sig) & 0xf];
 
 	return send_packet_in_place(buffer, 3);
 }
@@ -747,6 +754,8 @@ static bool step()
 {
 	set_special (SPCFLAG_BRK);
 	step_cpu = true;
+	did_step_cpu = true;
+
 	exception_debugging = 1;
 	return true;
 }
@@ -767,8 +776,8 @@ static bool handle_multi_letter_packet (char* packet, int length)
 {
 	int i = 0;
 
-	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet). 
-	
+	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet).
+
 	for (i = 0; i < length; ++i)
 	{
 		const char c = packet[i];
@@ -790,8 +799,8 @@ static bool handle_query_packet(char* packet, int length)
 {
 	int i = 0;
 
-	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet). 
-	
+	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet).
+
 	for (i = 0; i < length; ++i)
 	{
 		const char c = packet[i];
@@ -802,7 +811,7 @@ static bool handle_query_packet(char* packet, int length)
 
 	packet[i] = 0;
 
-	printf("-------- query %s\n", packet);
+	printf("[query] %s\n", packet);
 
 	if (!strcmp ("QStartNoAckMode", packet)) {
 		need_ack = false;
@@ -826,11 +835,11 @@ static bool handle_thread ()
 static bool continue_exec (char* packet)
 {
 	// 'c [addr] Continue at addr, which is the address to resume. If addr is omitted, resume at current address.
-	
+
 	if (*packet != '#')
 	{
 		uae_u32 address;
-	
+
 		if (sscanf (packet, "%x#", &address) != 1)
 		{
 			printf("Unable to parse continnue packet %s\n", packet);
@@ -852,7 +861,7 @@ static bool handle_packet(char* packet, int length)
 {
 	const char command = *packet;
 
-	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet). 
+	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet).
 
 	if (command == 'v')
 		return handle_multi_letter_packet(packet, length);
@@ -900,7 +909,7 @@ static bool parse_packet(char* packet, int size)
 
 	// calc checksum
 
-	for (int i = start + 1; i < end; ++i) 
+	for (int i = start + 1; i < end; ++i)
 		calc_checksum += packet[i];
 
 	// Read read the checksum and make sure they match
@@ -910,6 +919,7 @@ static bool parse_packet(char* packet, int size)
 
 	if (read_checksum != calc_checksum) {
 		if (need_ack) {
+			printf("[<----] -\n");
 			rconn_send (s_conn, "-", 1, 0);
 		}
 
@@ -917,8 +927,10 @@ static bool parse_packet(char* packet, int size)
 		return false;
 	}
 
-	if (need_ack)
+	if (need_ack) {
+		printf("[<----] +\n");
 		rconn_send (s_conn, "+", 1, 0);
+	}
 
 	// set end of string on the end marker
 
@@ -926,6 +938,7 @@ static bool parse_packet(char* packet, int size)
 }
 
 static int try_boot = 0;
+static int first = 0;
 
 extern void debugger_boot();
 
@@ -933,15 +946,20 @@ extern void debugger_boot();
 
 static void remote_debug_ (void)
 {
+	/*
 	if (!try_boot) {
 		printf("debugger boot\n");
 		debugger_boot();
 		try_boot = 1;
 	}
+	*/
 
-	// send exception
+	// send exception after we stepped the CPU
 
-	send_exception();
+	if (did_step_cpu) {
+		send_exception();
+		did_step_cpu = true;
+	}
 
 	while (1)
 	{
@@ -950,7 +968,7 @@ static void remote_debug_ (void)
 
 			int size = rconn_recv(s_conn, temp, sizeof(temp), 0);
 
-			printf("got data %s (%d)\n", temp, size);
+			printf("[---->] %s\n", temp);
 
 			if (size > 0)
 				parse_packet(temp, size);
@@ -961,7 +979,7 @@ static void remote_debug_ (void)
 		if (step_cpu)
 			break;
 
-		sleep_millis (10);	// don't hammer
+		sleep_millis (1);	// don't hammer
 	}
 
 	step_cpu = false;
@@ -990,7 +1008,7 @@ static void remote_debug_update_ (void)
 //    D0                D1         D2       D3      D4
 //
 //    LONG RunCommand(BPTR, ULONG, STRPTR, ULONG)
-// 
+//
 void remote_debug_start_executable (struct TrapContext *context)
 {
 	m68k_dreg (regs, 1) = 0;
@@ -1006,7 +1024,7 @@ void remote_debug_end_executable (struct TrapContext *context)
 // These are just wrappers to expose the code to C from C++
 //
 
-extern "C" 
+extern "C"
 {
 
 void remote_debug_init (int time_out) { remote_debug_init_ (time_out); }
