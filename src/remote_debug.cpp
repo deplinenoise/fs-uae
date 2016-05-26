@@ -77,8 +77,11 @@ static bool step_cpu = false;
 static bool did_step_cpu = false;
 static uae_u8 s_lastSent[1024];
 static int s_lastSize = 0;
+static bool need_ack = true;
 
 extern "C" { int remote_debugging = 0; }
+
+#define DEBUG_LOG
 
 enum ConnectionType
 {
@@ -269,8 +272,13 @@ static int rconn_disconnect (rconn* conn)
 {
     debug_log("Disconnected\n");
 
+	// reset the ack mode if client disconnected
+	need_ack = true;
+
     if (conn->socket != INVALID_SOCKET)
         closesocket(conn->socket);
+
+    debug_log("set invalid socket\n");
 
     conn->socket = INVALID_SOCKET;
 
@@ -285,6 +293,8 @@ static int rconn_recv (rconn* conn, char* buffer, int length, int flags)
         return 0;
 
     ret = (int)recv(conn->socket, buffer, (size_t)length, flags);
+
+    printf("recv %d\n", ret);
 
     if (ret <= 0)
     {
@@ -397,7 +407,6 @@ const int find_marker(const char* packet, const int offset, const char c, const 
 
 static const char s_hexchars [] = "0123456789abcdef";
 static const char* s_ok = "$OK#9a";
-static bool need_ack = true;
 
 static int safe_addr (uaecptr addr, int size)
 {
@@ -963,6 +972,9 @@ static void remote_debug_ (void)
 
 	while (1)
 	{
+		// this function will just exit if already connected
+		rconn_update_listner (s_conn);
+
 		if (rconn_poll_read(s_conn)) {
 			char temp[1024] = { 0 };
 
