@@ -69,6 +69,16 @@
 #define closesocket close
 #endif
 
+#define MAX_BREAKPOINT_COUNT 512
+
+enum DebuggerState
+{
+	Running,
+	Tracing,
+};
+
+static DebuggerState s_state = Running;
+
 //
 // Internal socket code
 //
@@ -78,6 +88,7 @@ static bool did_step_cpu = false;
 static uae_u8 s_lastSent[1024];
 static int s_lastSize = 0;
 static bool need_ack = true;
+static unsigned int s_socket_update_count = 0;
 
 extern "C" { int remote_debugging = 0; }
 
@@ -223,6 +234,9 @@ static int client_connect (rconn* conn, struct sockaddr_in* host)
     if (NULL != host)
         *host = hostTemp;
 
+    // If we got an connection we need to switch to tracing mode directly as this is required by gdb
+
+	s_state = Tracing;
     debug_log("Accept done\n");
 
     return 1;
@@ -380,6 +394,14 @@ static void remote_debug_init_ (int time_out)
 		sleep_millis (100);	// sleep for 100 ms to not hammer on the socket while waiting
 	}
 }
+
+struct Breakpoint {
+	uaecptr address;
+	bool enabled;
+};
+
+static Breakpoint s_breakpoints[MAX_BREAKPOINT_COUNT];
+static int s_breakpoint_count = 0;
 
 static int hex(char ch)
 {
@@ -858,13 +880,88 @@ static bool continue_exec (char* packet)
 		m68k_setpci(address);
 	}
 
-	//send_packet_string ("S00");
+	set_special (SPCFLAG_BRK);
+	s_state = Running;
+	exception_debugging = 0;
 	reply_ok ();
-	deactivate_debugger ();
 	step_cpu = true;
 
 	return true;
 }
+
+static int has_breakpoint_address(uaecptr address)
+{
+	for (int i = 0; i < s_breakpoint_count; ++i)
+	{
+		if (s_breakpoints[i].address == address)
+			return i;
+	}
+
+	return -1;
+}
+
+static bool set_breakpoint_address (char* packet, int add)
+{
+	uaecptr address;
+
+	if (sscanf (packet, "%x,", &address) != 1)
+	{
+		printf("failed to parse memory packet: %s\n", packet);
+		send_packet_string ("");
+		return false;
+	}
+
+	int bp_offset = has_breakpoint_address(address);
+
+	// Check if we already have a breakpoint at the address, if we do skip it
+
+	if (!add)
+	{
+		if (bp_offset != -1)
+		{
+			printf("Removed breakpoint at 0x%8x\n", address);
+			s_breakpoints[bp_offset] = s_breakpoints[s_breakpoint_count - 1];
+			s_breakpoint_count--;
+		}
+
+		return reply_ok ();
+	}
+
+	if (s_breakpoint_count + 1 >= MAX_BREAKPOINT_COUNT)
+	{
+		printf("Max number of breakpoints (%d) has been reached. Removed some to add new ones", MAX_BREAKPOINT_COUNT);
+		send_packet_string ("");
+		return false;
+	}
+
+	printf("Added breakpoint at 0x%08x", address);
+
+	s_breakpoints[s_breakpoint_count].address = address;
+	s_breakpoint_count++;
+
+	return reply_ok ();
+}
+
+static bool set_breakpoint (char* packet, int add)
+{
+	switch (*packet)
+	{
+		case '0' :
+		{
+			// skip zero and  ,
+			return set_breakpoint_address(packet + 2, add);
+		}
+
+		// Only 0 is supported now
+
+		default:
+		{
+			send_packet_string ("");
+			return false;
+		}
+	}
+}
+
 
 static bool handle_packet(char* packet, int length)
 {
@@ -888,6 +985,8 @@ static bool handle_packet(char* packet, int length)
 		case 'm' : return send_memory (packet + 1);
 		case 'M' : return set_memory (packet + 1, length - 1);
 		case 'c' : return continue_exec (packet + 1);
+		case 'Z' : return set_breakpoint (packet + 1, 1);
+		case 'z' : return set_breakpoint (packet + 1, 0);
 
 		default : send_packet_string ("");
 	}
@@ -946,57 +1045,84 @@ static bool parse_packet(char* packet, int size)
 	return handle_packet(&packet[start + 1], size - 1);
 }
 
-static int try_boot = 0;
-static int first = 0;
-
 extern void debugger_boot();
+
+static void update_connection (void)
+{
+	// this function will just exit if already connected
+	rconn_update_listner (s_conn);
+
+	if (rconn_poll_read(s_conn)) {
+		char temp[1024] = { 0 };
+
+		int size = rconn_recv(s_conn, temp, sizeof(temp), 0);
+
+		printf("[---->] %s\n", temp);
+
+		if (size > 0)
+			parse_packet(temp, size);
+	}
+}
 
 // Main function that will be called when doing the actual debugging
 
 static void remote_debug_ (void)
 {
-	/*
-	if (!try_boot) {
-		printf("debugger boot\n");
-		debugger_boot();
-		try_boot = 1;
-	}
-	*/
+	uaecptr pc = m68k_getpc ();
 
-	// send exception after we stepped the CPU
-
-	if (did_step_cpu) {
-		send_exception();
-		did_step_cpu = true;
-	}
-
-	while (1)
+	for (int i = 0; i < s_breakpoint_count; ++i)
 	{
-		// this function will just exit if already connected
-		rconn_update_listner (s_conn);
+		set_special (SPCFLAG_BRK);
 
-		if (rconn_poll_read(s_conn)) {
-			char temp[1024] = { 0 };
+		if (s_breakpoints[i].address == pc)
+		{
+			s_state = Tracing;
+			break;
+		}
+	}
 
-			int size = rconn_recv(s_conn, temp, sizeof(temp), 0);
+	// Check if we hit some breakpoint and then switch to tracing if we do
 
-			printf("[---->] %s\n", temp);
+	switch (s_state)
+	{
+		case Running:
+		{
+			s_socket_update_count++;
 
-			if (size > 0)
-				parse_packet(temp, size);
+			// don't update the connectio the whole time if we are in runnig state
+			// but update after 2048 instructinos has been executed so the
+			// polling of the socket doesn't
+
+			if (s_socket_update_count == 2048)
+			{
+				update_connection ();
+				s_socket_update_count = 0;
+			}
+
+			break;
 		}
 
-		// if this has been set > 0 it means that we need to loop back to uae and step some code
+		case Tracing:
+		{
+			send_exception ();
 
-		if (step_cpu)
+			while (1)
+			{
+				update_connection ();
+
+				if (step_cpu)
+				{
+					printf("jumping back to uae for cpu step\n");
+					step_cpu = false;
+					break;
+				}
+
+				sleep_millis (1);	// don't hammer
+			}
+
 			break;
-
-		sleep_millis (1);	// don't hammer
+		}
 	}
-
-	step_cpu = false;
-
-	printf("jumping back to uae for cpu step\n");
 }
 
 // This function needs to be called at regular interval to keep the socket connection alive
