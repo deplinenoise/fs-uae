@@ -90,7 +90,10 @@ static int s_lastSize = 0;
 static bool need_ack = true;
 static unsigned int s_socket_update_count = 0;
 
-extern "C" { int remote_debugging = 0; }
+extern "C" {
+	int fs_emu_is_quitting();
+	int remote_debugging = 0;
+}
 
 #define DEBUG_LOG
 
@@ -1114,6 +1117,14 @@ static void remote_debug_ (void)
 				{
 					printf("jumping back to uae for cpu step\n");
 					step_cpu = false;
+					break;
+				}
+
+				if (fs_emu_is_quitting())
+				{
+					printf("request quit\n");
+					s_state = Running;
+					rconn_destroy(s_conn);
 					break;
 				}
 
