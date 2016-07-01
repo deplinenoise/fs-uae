@@ -69,6 +69,8 @@
 #define closesocket close
 #endif
 
+extern int debug_dma;
+
 #define MAX_BREAKPOINT_COUNT 512
 
 enum DebuggerState
@@ -1052,6 +1054,7 @@ extern void debugger_boot();
 
 static void update_connection (void)
 {
+
 	// this function will just exit if already connected
 	rconn_update_listner (s_conn);
 
@@ -1140,6 +1143,14 @@ static void remote_debug_ (void)
 
 static void remote_debug_update_ (void)
 {
+	static int counter = 0;
+	counter++;
+	//printf("counter %d\n", counter++);
+	if (counter == 320) {
+		printf("activate debug_dma\n");
+		debug_dma = 2;
+	}
+
 	if (!s_conn)
 		return;
 
@@ -1147,6 +1158,11 @@ static void remote_debug_update_ (void)
 
 	if (rconn_poll_read(s_conn))
 		activate_debugger ();
+}
+
+static void rec_dma_event (int evt, int hpos, int vpos) 
+{ 
+	printf("rec_dma_event %d - (%d:%d)\n", evt, hpos, vpos); 
 }
 
 // Called from debugger_helper. At this point CreateProcess has been called
@@ -1179,6 +1195,7 @@ extern "C"
 void remote_debug_init (int time_out) { remote_debug_init_ (time_out); }
 void remote_debug (void) { remote_debug_ (); }
 void remote_debug_update (void) { remote_debug_update_ (); }
+void remote_record_dma_event (int evt, int hpos, int vpos) { rec_dma_event(evt, hpos, vpos); }
 
 }
 

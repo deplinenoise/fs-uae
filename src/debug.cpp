@@ -796,7 +796,7 @@ static uaecptr nextaddr (uaecptr addr, uaecptr last, uaecptr *end)
 {
 	static uaecptr old;
 	int next = last;
-	if (last && 0) {
+	if (0) {
 		if (addr >= last)
 			return 0xffffffff;
 		return addr + 1;
@@ -1077,6 +1077,13 @@ void debug_draw_cycles (uae_u8 *buf, int bpp, int line, int width, int height, u
 	int t;
 	uae_u32 cc[DMARECORD_MAX];
 
+#ifdef REMOTE_DEBUGGER
+	// Remote debugger handles this internally instead
+	if (remote_debugging) {
+		return;
+	}
+#endif
+
 	if (debug_dma >= 4)
 		yplus = 2;
 	else
@@ -1154,6 +1161,13 @@ static void record_dma_heatmap (uaecptr addr, int type)
 void record_dma_event (int evt, int hpos, int vpos)
 {
 	struct dma_rec *dr;
+
+#ifdef REMOTE_DEBUGGER
+	if (remote_debugging) {
+		remote_record_dma_event (evt, hpos, vpos);
+		return;
+	}
+#endif
 
 	if (!dma_record[0])
 		return;

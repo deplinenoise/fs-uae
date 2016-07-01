@@ -40,6 +40,10 @@ void remote_debug_init (int time_out);
 
 void remote_debug (void);
 
+// Allow remote debugger to have info about about dma events 
+
+void remote_record_dma_event (int evt, int hpos, int vpos);
+
 // This function needs to be called at regular interval to keep the socket connection alive
 
 void remote_debug_update (void);
