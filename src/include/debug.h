@@ -145,6 +145,9 @@ struct dma_rec
 	uae_s8 intlev;
 };
 
+#define NR_DMA_REC_HPOS 256
+#define NR_DMA_REC_VPOS 1000
+
 #define DMA_EVENT_BLITIRQ 1
 #define DMA_EVENT_BLITNASTY 2
 #define DMA_EVENT_BLITSTARTFINISH 4

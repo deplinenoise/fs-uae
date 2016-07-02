@@ -11,11 +11,14 @@
 #ifndef UAE_REMOTE_DEBUG_H
 #define UAE_REMOTE_DEBUG_H
 
+#include "debug.h"
+
 #define REMOTE_DEBUGGER
 
 #ifdef REMOTE_DEBUGGER
 
 struct TrapContext;
+struct dma_rec;
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,7 +45,11 @@ void remote_debug (void);
 
 // Allow remote debugger to have info about about dma events 
 
+struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, 
+								   int hpos, int vpos, int type);
 void remote_record_dma_event (int evt, int hpos, int vpos);
+void remote_record_dma_reset (void);
+void remote_debug_draw_cycles (int line, int width, int height);
 
 // This function needs to be called at regular interval to keep the socket connection alive
 

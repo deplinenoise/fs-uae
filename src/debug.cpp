@@ -1010,6 +1010,13 @@ void record_dma_reset (void)
 	int v, h;
 	struct dma_rec *dr, *dr2;
 
+#ifdef REMOTE_DEBUGGER
+	if (remote_debugging) {
+		remote_record_dma_reset ();
+		return;
+	}
+#endif
+
 	if (!dma_record[0])
 		return;
 	dma_record_toggle ^= 1;
@@ -1078,8 +1085,9 @@ void debug_draw_cycles (uae_u8 *buf, int bpp, int line, int width, int height, u
 	uae_u32 cc[DMARECORD_MAX];
 
 #ifdef REMOTE_DEBUGGER
-	// Remote debugger handles this internally instead
 	if (remote_debugging) {
+		// internal call only to trigger that we are done with the frame
+		remote_debug_draw_cycles (line, width, height); 
 		return;
 	}
 #endif
@@ -1180,6 +1188,12 @@ void record_dma_event (int evt, int hpos, int vpos)
 struct dma_rec *record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, int hpos, int vpos, int type)
 {
 	struct dma_rec *dr;
+
+#ifdef REMOTE_DEBUGGER
+	if (remote_debugging) {
+		return remote_record_dma (reg, dat, addr, hpos, vpos, type);
+	}
+#endif
 
 	if (!heatmap)
 		heatmap = xcalloc (struct memory_heatmap, 16 * 1024 * 1024 / 2);

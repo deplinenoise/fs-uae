@@ -24,6 +24,14 @@
 //
 // TODO: List and implement extensions
 //
+//-----------------
+//
+// QDmaTime
+//
+// GDB Extension for Amiga that shows DMA timings on one raster-line
+//
+// u16 line,xsize,
+// x size * u16 event, u16 type
 
 #include "remote_debug.h"
 #ifdef REMOTE_DEBUGGER
@@ -70,6 +78,10 @@
 #endif
 
 extern int debug_dma;
+
+static struct dma_rec *dma_record[2];
+static int dma_record_toggle;
+static int live_mode = 0;
 
 #define MAX_BREAKPOINT_COUNT 512
 
@@ -474,6 +486,19 @@ static uae_u8* write_reg_32 (unsigned char* dest, uae_u32 v)
 	*dest++ = s_hexchars[c2 & 0xf];
 	*dest++ = s_hexchars[c3 >> 4];
 	*dest++ = s_hexchars[c3 & 0xf];
+
+	return dest;
+}
+
+static uae_u8* write_u16 (unsigned char* dest, uae_u32 v)
+{
+	uae_u8 c0 = (v >> 8) & 0xff;
+	uae_u8 c1 = (v >> 0) & 0xff;
+
+	*dest++ = s_hexchars[c0 >> 4];
+	*dest++ = s_hexchars[c0 & 0xf];
+	*dest++ = s_hexchars[c1 >> 4];
+	*dest++ = s_hexchars[c1 & 0xf];
 
 	return dest;
 }
@@ -1143,27 +1168,136 @@ static void remote_debug_ (void)
 
 static void remote_debug_update_ (void)
 {
+	/*
 	static int counter = 0;
 	counter++;
 	//printf("counter %d\n", counter++);
-	if (counter == 320) {
+	if (counter == 1000) {
 		printf("activate debug_dma\n");
 		debug_dma = 2;
 	}
+	*/
 
 	if (!s_conn)
 		return;
 
 	rconn_update_listner (s_conn);
 
-	if (rconn_poll_read(s_conn))
+	if (rconn_poll_read(s_conn)) {
 		activate_debugger ();
+	}
 }
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void rec_dma_event (int evt, int hpos, int vpos) 
 { 
-	printf("rec_dma_event %d - (%d:%d)\n", evt, hpos, vpos); 
+	if (!dma_record[0])
+		return;
+
+	if (hpos >= NR_DMA_REC_HPOS || vpos >= NR_DMA_REC_VPOS)
+		return;
+
+	dma_rec* dr = &dma_record[dma_record_toggle][vpos * NR_DMA_REC_HPOS + hpos];
+	dr->evt |= evt;
 }
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void rec_dma_reset (void)
+{
+	if (!dma_record[0])
+		return;
+
+	dma_record_toggle ^= 1;
+	dma_rec* dr = dma_record[dma_record_toggle];
+	for (int v = 0; v < NR_DMA_REC_VPOS; v++) {
+		for (int h = 0; h < NR_DMA_REC_HPOS; h++) {
+			dma_rec* dr2 = &dr[v * NR_DMA_REC_HPOS + h];
+			memset (dr2, 0, sizeof (struct dma_rec));
+			dr2->reg = 0xffff;
+			dr2->addr = 0xffffffff;
+		}
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void draw_cycles (int line, int width, int height)
+{
+	if (!rconn_is_connected (s_conn))
+		return;
+
+	printf("wants to send %d\n", line);
+
+	int y = line; 
+
+	if (y < 0)
+		return;
+	if (y > maxvpos)
+		return;
+	if (y >= height)
+		return;
+
+	int t = dma_record_toggle ^ 1;
+
+	uae_u8 temp[(NR_DMA_REC_HPOS * sizeof(dma_rec) * 2) + 256];
+	uae_u8* buffer = temp;
+
+	const int tag_size = 10;
+
+	memcpy(buffer, "$QDmaTime:", tag_size);
+	buffer += tag_size;
+
+	//*buffer++ = '$';
+
+	buffer = write_u16(buffer, line);
+	buffer = write_u16(buffer, maxhpos);
+
+	printf("maxhpos %d\n", maxhpos);
+
+	for (int x = 0; x < maxhpos; x++) {
+		dma_rec* dr = &dma_record[t][y * NR_DMA_REC_HPOS + x];
+		buffer = write_u16(buffer, dr->evt);
+		buffer = write_u16(buffer, dr->type);
+	}
+
+	// TODO: Handle error
+	
+	(void)send_packet_in_place(temp, (int)((uintptr_t)temp - (uintptr_t)buffer) - 1);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, 
+								   int hpos, int vpos, int type)
+{
+	if (!dma_record[0]) {
+		dma_record[0] = xmalloc (struct dma_rec, NR_DMA_REC_HPOS * NR_DMA_REC_VPOS);
+		dma_record[1] = xmalloc (struct dma_rec, NR_DMA_REC_HPOS * NR_DMA_REC_VPOS);
+		dma_record_toggle = 0;
+		record_dma_reset ();
+	}
+
+	if (hpos >= NR_DMA_REC_HPOS || vpos >= NR_DMA_REC_VPOS)
+		return NULL;
+
+	dma_rec* dr = &dma_record[dma_record_toggle][vpos * NR_DMA_REC_HPOS + hpos];
+
+	if (dr->reg != 0xffff) {
+		write_log (_T("DMA conflict: v=%d h=%d OREG=%04X NREG=%04X\n"), vpos, hpos, dr->reg, reg);
+		return dr;
+	}
+
+	dr->reg = reg;
+	dr->dat = dat;
+	dr->addr = addr;
+	dr->type = type;
+	dr->intlev = regs.intmask;
+
+	return dr;
+}
+
 
 // Called from debugger_helper. At this point CreateProcess has been called
 // and we are resposible for filling out the data needed by the "RunCommand"
@@ -1196,6 +1330,11 @@ void remote_debug_init (int time_out) { remote_debug_init_ (time_out); }
 void remote_debug (void) { remote_debug_ (); }
 void remote_debug_update (void) { remote_debug_update_ (); }
 void remote_record_dma_event (int evt, int hpos, int vpos) { rec_dma_event(evt, hpos, vpos); }
+void remote_record_dma_reset (void) { rec_dma_reset (); }
+void remote_debug_draw_cycles (int line, int width, int height) { draw_cycles(line, width, height); }
+struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, 
+								   int hpos, int vpos, int type);
+
 
 }
 
