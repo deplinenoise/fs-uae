@@ -219,6 +219,9 @@ static struct rconn* rconn_create (enum ConnectionType type, int port)
 
 static void rconn_destroy (struct rconn* conn)
 {
+	if (!conn)
+		return;
+
     if (conn->socket != INVALID_SOCKET)
         closesocket(conn->socket);
 
@@ -468,6 +471,7 @@ static int safe_addr (uaecptr addr, int size)
 
 static bool reply_ok()
 {
+	printf("[<----] %s\n", s_ok);
 	return rconn_send (s_conn, s_ok, 6, 0) == 6;
 }
 
@@ -591,6 +595,7 @@ static bool send_registers (void)
 	buffer = write_reg_32 (buffer, m68k_getpc ());
 
 #ifdef FPUEMU
+	/*
 	if (currprefs.fpu_model)
 	{
 		for (int i = 0; i < 8; ++i)
@@ -600,6 +605,7 @@ static bool send_registers (void)
 		buffer = write_reg_32 (buffer, regs.fpsr);
 		buffer = write_reg_32 (buffer, regs.fpiar);
 	}
+	*/
 #endif
 
 	return send_packet_in_place(t, (int)((uintptr_t)buffer - (uintptr_t)t) - 1);
@@ -746,6 +752,7 @@ static bool set_registers (const uae_u8* data)
 	regs.pc = get_u32 (&data);
 
 #ifdef FPUEMU
+	/*
 	if (currprefs.fpu_model)
 	{
 		for (int i = 0; i < 8; ++i)
@@ -755,6 +762,7 @@ static bool set_registers (const uae_u8* data)
 		regs.fpsr = get_u32 (&data);
 		regs.fpiar = get_u32 (&data);
 	}
+	*/
 #endif
 
 	reply_ok();
@@ -873,15 +881,22 @@ static bool handle_query_packet(char* packet, int length)
 	packet[i] = 0;
 
 	printf("[query] %s\n", packet);
+	printf("handle_query_packet %d\n", __LINE__);
 
 	if (!strcmp ("QStartNoAckMode", packet)) {
+		printf("handle_query_packet %d\n", __LINE__);
 		need_ack = false;
 		return reply_ok ();
 	}
-	else if (!strcmp (packet, "qSupported"))
+	else if (!strcmp (packet, "qSupported")) {
+		printf("handle_query_packet %d\n", __LINE__);
 		send_packet_string ("QStartNoAckMode+");
-	else
+	} else {
+		printf("handle_query_packet %d\n", __LINE__);
 		send_packet_string ("");
+	}
+
+	printf("handle_query_packet %d\n", __LINE__);
 
 	return true;
 }
@@ -910,6 +925,8 @@ static bool continue_exec (char* packet)
 		m68k_setpci(address);
 	}
 
+	printf("start running...\n");
+
 	set_special (SPCFLAG_BRK);
 	s_state = Running;
 	exception_debugging = 0;
@@ -934,6 +951,8 @@ static bool set_breakpoint_address (char* packet, int add)
 {
 	uaecptr address;
 
+	printf("parsing breakpoint\n");
+
 	if (sscanf (packet, "%x,", &address) != 1)
 	{
 		printf("failed to parse memory packet: %s\n", packet);
@@ -941,21 +960,32 @@ static bool set_breakpoint_address (char* packet, int add)
 		return false;
 	}
 
+	printf("parsed 0x%x\n", address);
+
+	printf("%s:%d\n", __FILE__, __LINE__);
+
 	int bp_offset = has_breakpoint_address(address);
+
+	printf("%s:%d\n", __FILE__, __LINE__);
 
 	// Check if we already have a breakpoint at the address, if we do skip it
 
 	if (!add)
 	{
+		printf("%s:%d\n", __FILE__, __LINE__);
 		if (bp_offset != -1)
 		{
+			printf("%s:%d\n", __FILE__, __LINE__);
 			printf("Removed breakpoint at 0x%8x\n", address);
 			s_breakpoints[bp_offset] = s_breakpoints[s_breakpoint_count - 1];
 			s_breakpoint_count--;
 		}
 
+		printf("%s:%d\n", __FILE__, __LINE__);
 		return reply_ok ();
 	}
+
+	printf("%s:%d\n", __FILE__, __LINE__);
 
 	if (s_breakpoint_count + 1 >= MAX_BREAKPOINT_COUNT)
 	{
@@ -964,7 +994,9 @@ static bool set_breakpoint_address (char* packet, int add)
 		return false;
 	}
 
-	printf("Added breakpoint at 0x%08x", address);
+	printf("%s:%d\n", __FILE__, __LINE__);
+
+	printf("Added breakpoint at 0x%08x\n", address);
 
 	s_breakpoints[s_breakpoint_count].address = address;
 	s_breakpoint_count++;
@@ -986,6 +1018,7 @@ static bool set_breakpoint (char* packet, int add)
 
 		default:
 		{
+			printf("unknown breakpoint type\n");
 			send_packet_string ("");
 			return false;
 		}
@@ -1079,6 +1112,8 @@ extern void debugger_boot();
 
 static void update_connection (void)
 {
+	if (fs_emu_is_quitting())
+		return;
 
 	// this function will just exit if already connected
 	rconn_update_listner (s_conn);
@@ -1105,8 +1140,11 @@ static void remote_debug_ (void)
 	{
 		set_special (SPCFLAG_BRK);
 
+		printf("checking breakpoint %08x - %08x\n", s_breakpoints[i].address, pc);
+
 		if (s_breakpoints[i].address == pc)
 		{
+			printf("switching to tracing\n");
 			s_state = Tracing;
 			break;
 		}
@@ -1135,7 +1173,10 @@ static void remote_debug_ (void)
 
 		case Tracing:
 		{
+			if (did_step_cpu) {
 			send_exception ();
+				did_step_cpu = false;
+			}
 
 			while (1)
 			{
@@ -1153,6 +1194,7 @@ static void remote_debug_ (void)
 					printf("request quit\n");
 					s_state = Running;
 					rconn_destroy(s_conn);
+					s_conn = 0;
 					break;
 				}
 
@@ -1185,7 +1227,7 @@ static void remote_debug_update_ (void)
 
 	if (rconn_poll_read(s_conn)) {
 		activate_debugger ();
-	}
+}
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1334,6 +1376,7 @@ void remote_record_dma_reset (void) { rec_dma_reset (); }
 void remote_debug_draw_cycles (int line, int width, int height) { draw_cycles(line, width, height); }
 struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, 
 								   int hpos, int vpos, int type);
+int fs_emu_is_quitting();
 
 
 }
