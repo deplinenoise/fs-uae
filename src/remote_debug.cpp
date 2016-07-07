@@ -808,6 +808,8 @@ static int map_68k_exception(int exception) {
 static bool send_exception (void) {
 
 	unsigned char buffer[16] = { 0 };
+	
+	printf("send exception\n");
 
 	int sig = map_68k_exception (regs.exception);
 
@@ -1144,6 +1146,7 @@ static void remote_debug_ (void)
 
 		if (s_breakpoints[i].address == pc)
 		{
+			send_exception ();
 			printf("switching to tracing\n");
 			s_state = Tracing;
 			break;
@@ -1174,7 +1177,8 @@ static void remote_debug_ (void)
 		case Tracing:
 		{
 			if (did_step_cpu) {
-			send_exception ();
+				printf("did step cpu\n");
+				send_exception ();
 				did_step_cpu = false;
 			}
 
