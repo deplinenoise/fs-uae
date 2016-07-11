@@ -26,12 +26,16 @@
 //
 //-----------------
 //
-// QDmaTime
+// QDmaLine
 //
 // GDB Extension for Amiga that shows DMA timings on one raster-line
 //
 // u16 line,xsize,
 // x size * u16 event, u16 type
+//
+// QDmaFrame
+//
+// Send a full-frame worth of timing data
 
 #include "remote_debug.h"
 #ifdef REMOTE_DEBUGGER
@@ -79,9 +83,17 @@
 
 extern int debug_dma;
 
-static struct dma_rec *dma_record[2];
+typedef struct dma_info {
+	uae_u32 event;
+	uae_u32 type;
+} dma_info;
+
+static struct dma_rec* dma_record[2];
+static struct dma_info* dma_info_rec[2];
 static int dma_record_toggle;
 static int live_mode = 0;
+static int debug_dma_frame = 0;
+static int dma_max_sizes[2][2];
 
 #define MAX_BREAKPOINT_COUNT 512
 
@@ -360,14 +372,15 @@ static int rconn_send(rconn* conn, const void* buffer, int length, int flags)
 
     if ((ret = (int)send(conn->socket, buffer, (size_t)length, flags)) != (int)length)
     {
+    	printf("disconnected because length doesn't match (expected %d but got %d)\n", length, ret);
         rconn_disconnect(conn);
         return 0;
     }
 
     // take a copy of what we sent last if we need to resend it
 
-	memcpy (s_lastSent, buffer, length);
-	s_lastSize = length;
+	//memcpy (s_lastSent, buffer, length);
+	s_lastSize = 0;
 
     return ret;
 }
@@ -494,18 +507,34 @@ static uae_u8* write_reg_32 (unsigned char* dest, uae_u32 v)
 	return dest;
 }
 
-static uae_u8* write_u16 (unsigned char* dest, uae_u32 v)
+static uae_u8* write_u16 (unsigned char* dest, uae_u16 v)
 {
 	uae_u8 c0 = (v >> 8) & 0xff;
 	uae_u8 c1 = (v >> 0) & 0xff;
 
-	*dest++ = s_hexchars[c0 >> 4];
-	*dest++ = s_hexchars[c0 & 0xf];
-	*dest++ = s_hexchars[c1 >> 4];
-	*dest++ = s_hexchars[c1 & 0xf];
+	dest[0] = s_hexchars[c0 >> 4];
+	dest[1] = s_hexchars[c0 & 0xf];
+	dest[2] = s_hexchars[c1 >> 4];
+	dest[3] = s_hexchars[c1 & 0xf];
 
-	return dest;
+	return dest + 4;
 }
+
+static uae_u8* write_u8 (unsigned char* dest, uae_u8 v)
+{
+	dest[0] = s_hexchars[v >> 4];
+	dest[1] = s_hexchars[v & 0xf];
+
+	return dest + 2;
+}
+
+static uae_u8* write_string (unsigned char* dest, const char* name)
+{
+	int len = strlen(name);
+	memcpy(dest, name, len);
+	return dest + len;
+}
+
 
 static uae_u8* write_reg_double (uae_u8* dest, double v)
 {
@@ -546,7 +575,8 @@ static bool send_packet_in_place (unsigned char* t, int length)
 	t[length + 3] = s_hexchars[cs & 0xf];
 	t[length + 4] = 0;
 
-	printf("[<----] %s\n", t);
+	//printf("[<----] <inplace>\n");
+	//printf("[<----] %s\n", t);
 
 	return rconn_send(s_conn, t, length + 4, 0) == length + 4;
 }
@@ -808,7 +838,7 @@ static int map_68k_exception(int exception) {
 static bool send_exception (void) {
 
 	unsigned char buffer[16] = { 0 };
-	
+
 	printf("send exception\n");
 
 	int sig = map_68k_exception (regs.exception);
@@ -893,6 +923,12 @@ static bool handle_query_packet(char* packet, int length)
 	else if (!strcmp (packet, "qSupported")) {
 		printf("handle_query_packet %d\n", __LINE__);
 		send_packet_string ("QStartNoAckMode+");
+	} else if (!strcmp (packet, "QDmaTimeEnable")) {
+		printf("Enable dma debugging\n");
+		bool ret = reply_ok ();
+		debug_dma_frame = 1;
+		debug_dma = 2;
+		return ret;
 	} else {
 		printf("handle_query_packet %d\n", __LINE__);
 		send_packet_string ("");
@@ -931,7 +967,7 @@ static bool continue_exec (char* packet)
 
 	set_special (SPCFLAG_BRK);
 	s_state = Running;
-	exception_debugging = 0;
+	//exception_debugging = 0;
 	reply_ok ();
 	step_cpu = true;
 
@@ -1161,11 +1197,7 @@ static void remote_debug_ (void)
 		{
 			s_socket_update_count++;
 
-			// don't update the connectio the whole time if we are in runnig state
-			// but update after 2048 instructinos has been executed so the
-			// polling of the socket doesn't
-
-			if (s_socket_update_count == 2048)
+			//if (s_socket_update_count >= 2048)
 			{
 				update_connection ();
 				s_socket_update_count = 0;
@@ -1224,20 +1256,28 @@ static void remote_debug_update_ (void)
 	}
 	*/
 
+	//debug_dma = 2;
+
 	if (!s_conn)
 		return;
 
 	rconn_update_listner (s_conn);
 
+	remote_debug_ ();
+	activate_debugger ();
+
+	/*
 	if (rconn_poll_read(s_conn)) {
+		printf("got data...\n");
 		activate_debugger ();
-}
+	}
+	*/
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static void rec_dma_event (int evt, int hpos, int vpos) 
-{ 
+static void rec_dma_event (int evt, int hpos, int vpos)
+{
 	if (!dma_record[0])
 		return;
 
@@ -1256,6 +1296,38 @@ static void rec_dma_reset (void)
 		return;
 
 	dma_record_toggle ^= 1;
+
+	int t = dma_record_toggle;
+
+	if (debug_dma_frame) {
+		if (dma_max_sizes[t][0] != 0) { // make sure we have valid data before sending it
+			uae_u8* buffer = (uae_u8*)dma_info_rec[t];
+			uae_u8* store = buffer;
+
+			uae_u16 line = dma_max_sizes[t][0];
+			uae_u16 hcount = dma_max_sizes[t][1];
+
+			buffer = write_string(buffer, "$QDmaFrame:");
+			buffer = write_u16(buffer, hcount);
+			buffer = write_u16(buffer, line);
+
+			for (int y = 0; y < line; y++) {
+				for (int x = 0; x < hcount; x++) {
+					dma_rec* dr = &dma_record[t][y * NR_DMA_REC_HPOS + x];
+					buffer = write_u8(buffer, (uae_u8)dr->evt);
+					buffer = write_u8(buffer, (uae_u8)dr->type);
+				}
+			}
+
+			int len = (int)((uintptr_t)buffer - (uintptr_t)store);
+
+			send_packet_in_place(store, len);
+		}
+	}
+
+	dma_max_sizes[dma_record_toggle][0] = 0;
+	dma_max_sizes[dma_record_toggle][1] = 0;
+
 	dma_rec* dr = dma_record[dma_record_toggle];
 	for (int v = 0; v < NR_DMA_REC_VPOS; v++) {
 		for (int h = 0; h < NR_DMA_REC_HPOS; h++) {
@@ -1271,12 +1343,11 @@ static void rec_dma_reset (void)
 
 void draw_cycles (int line, int width, int height)
 {
-	if (!rconn_is_connected (s_conn))
+	if (!dma_record[0]) {
 		return;
+	}
 
-	printf("wants to send %d\n", line);
-
-	int y = line; 
+	int y = line;
 
 	if (y < 0)
 		return;
@@ -1287,7 +1358,19 @@ void draw_cycles (int line, int width, int height)
 
 	int t = dma_record_toggle ^ 1;
 
-	uae_u8 temp[(NR_DMA_REC_HPOS * sizeof(dma_rec) * 2) + 256];
+	// only track stuff and send later
+
+	if (debug_dma_frame) {
+		if (line > dma_max_sizes[t][0])
+			dma_max_sizes[t][0] = line;
+
+		if (maxhpos > dma_max_sizes[t][1])
+			dma_max_sizes[t][1] = maxhpos;
+
+		return;
+	}
+
+	uae_u8 temp[(NR_DMA_REC_HPOS * sizeof(dma_rec) * 2) + 256] = { 0 };
 	uae_u8* buffer = temp;
 
 	const int tag_size = 10;
@@ -1300,27 +1383,32 @@ void draw_cycles (int line, int width, int height)
 	buffer = write_u16(buffer, line);
 	buffer = write_u16(buffer, maxhpos);
 
-	printf("maxhpos %d\n", maxhpos);
-
 	for (int x = 0; x < maxhpos; x++) {
 		dma_rec* dr = &dma_record[t][y * NR_DMA_REC_HPOS + x];
 		buffer = write_u16(buffer, dr->evt);
 		buffer = write_u16(buffer, dr->type);
 	}
 
+	int buffer_size = tag_size + 8 + (maxhpos * 8);
+
+	printf("buffer_size size to send (%d - %d) - %d\n", line, maxhpos, buffer_size);
+
 	// TODO: Handle error
-	
-	(void)send_packet_in_place(temp, (int)((uintptr_t)temp - (uintptr_t)buffer) - 1);
+
+	(void)send_packet_in_place(temp, buffer_size - 1);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, 
+struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr,
 								   int hpos, int vpos, int type)
 {
 	if (!dma_record[0]) {
 		dma_record[0] = xmalloc (struct dma_rec, NR_DMA_REC_HPOS * NR_DMA_REC_VPOS);
 		dma_record[1] = xmalloc (struct dma_rec, NR_DMA_REC_HPOS * NR_DMA_REC_VPOS);
+		dma_info_rec[0] = xmalloc (struct dma_info, (NR_DMA_REC_HPOS * (NR_DMA_REC_VPOS + 1) * 2)); // + 1 for extra dataO
+		dma_info_rec[1] = xmalloc (struct dma_info, (NR_DMA_REC_HPOS * (NR_DMA_REC_VPOS + 1) * 2)); // + 1 for extra data
+
 		dma_record_toggle = 0;
 		record_dma_reset ();
 	}
@@ -1378,7 +1466,7 @@ void remote_debug_update (void) { remote_debug_update_ (); }
 void remote_record_dma_event (int evt, int hpos, int vpos) { rec_dma_event(evt, hpos, vpos); }
 void remote_record_dma_reset (void) { rec_dma_reset (); }
 void remote_debug_draw_cycles (int line, int width, int height) { draw_cycles(line, width, height); }
-struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr, 
+struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr,
 								   int hpos, int vpos, int type);
 int fs_emu_is_quitting();
 
