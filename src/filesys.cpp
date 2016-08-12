@@ -8580,7 +8580,7 @@ void filesys_install (void)
 	dw (RTS);
 
 	org(rtarea_base + 0xFF3C);
-	calltrap(deftrap2(debugger_helper, 0, _T("debugger_helper")));
+	calltrap(deftrap2(debugger_helper, TRAPFLAG_EXTRA_STACK, _T("debugger_helper")));
 	dw(RTS);
 
 	org (rtarea_base + 0xFF40);
