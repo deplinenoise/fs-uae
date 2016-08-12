@@ -1,4 +1,3 @@
-//
 // UAE - The Un*x Amiga Emulator
 //
 // GDB Stub for UAE.
@@ -68,10 +67,15 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
-#include "defines.h"
-#include "debug.h"
-#include "newcpu.h"
+#include "sysconfig.h"
+#include "sysdeps.h"
+#include "options.h"
+#include "memory.h"
 #include "custom.h"
+#include "newcpu.h"
+#include "traps.h"
+#include "autoconf.h"
+#include "execlib.h"
 
 #ifndef INVALID_SOCKET
 #define INVALID_SOCKET -1
@@ -80,6 +84,8 @@
 #if !defined(_WIN32)
 #define closesocket close
 #endif
+
+extern void debugger_boot();
 
 extern int debug_dma;
 
@@ -887,6 +893,8 @@ static bool handle_multi_letter_packet (char* packet, int length)
 			break;
 	}
 
+	debugger_boot ();
+
 	// fine to assume that i is valid here as we have already checked that # is present
 
 	packet[i] = 0;
@@ -946,6 +954,14 @@ static bool handle_thread ()
 	return true;
 }
 
+static void deactive_debugger () {
+	set_special (SPCFLAG_BRK);
+	s_state = Running;
+	exception_debugging = 0;
+	debugger_active = 0;
+	step_cpu = true;
+}
+
 static bool continue_exec (char* packet)
 {
 	// 'c [addr] Continue at addr, which is the address to resume. If addr is omitted, resume at current address.
@@ -965,11 +981,9 @@ static bool continue_exec (char* packet)
 
 	printf("start running...\n");
 
-	set_special (SPCFLAG_BRK);
-	s_state = Running;
-	//exception_debugging = 0;
+	deactive_debugger ();
+
 	reply_ok ();
-	step_cpu = true;
 
 	return true;
 }
@@ -1146,12 +1160,13 @@ static bool parse_packet(char* packet, int size)
 	return handle_packet(&packet[start + 1], size - 1);
 }
 
-extern void debugger_boot();
 
 static void update_connection (void)
 {
 	if (fs_emu_is_quitting())
 		return;
+
+	printf("updating connection\n");
 
 	// this function will just exit if already connected
 	rconn_update_listner (s_conn);
@@ -1174,6 +1189,8 @@ static void remote_debug_ (void)
 {
 	uaecptr pc = m68k_getpc ();
 
+	printf("update remote-Debug %d\n", s_state);
+
 	for (int i = 0; i < s_breakpoint_count; ++i)
 	{
 		set_special (SPCFLAG_BRK);
@@ -1195,13 +1212,9 @@ static void remote_debug_ (void)
 	{
 		case Running:
 		{
-			s_socket_update_count++;
 
-			//if (s_socket_update_count >= 2048)
-			{
-				update_connection ();
-				s_socket_update_count = 0;
-			}
+			update_connection ();
+			s_socket_update_count = 0;
 
 			break;
 		}
@@ -1266,12 +1279,9 @@ static void remote_debug_update_ (void)
 	remote_debug_ ();
 	activate_debugger ();
 
-	/*
 	if (rconn_poll_read(s_conn)) {
-		printf("got data...\n");
 		activate_debugger ();
 	}
-	*/
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1432,6 +1442,7 @@ struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr,
 	return dr;
 }
 
+extern uaecptr get_base (const uae_char *name, int offset);
 
 // Called from debugger_helper. At this point CreateProcess has been called
 // and we are resposible for filling out the data needed by the "RunCommand"
@@ -1444,7 +1455,34 @@ struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr,
 //
 void remote_debug_start_executable (struct TrapContext *context)
 {
-	m68k_dreg (regs, 1) = 0;
+	uaecptr filename = ds ("dh0:hello");
+	uaecptr args = ds ("");
+
+	uaecptr dosbase = get_base ("dos.library", 378);
+
+	if (dosbase == 0) {
+		printf("Unable to get dosbase\n");
+		return;
+	}
+
+    m68k_dreg (regs, 1) = filename;
+	CallLib (context, dosbase, -150 );
+
+    uaecptr segs = m68k_dreg (regs, 0);
+
+    if (segs == 0) {
+    	printf("Unable to load segs\n");
+    	return;
+	}
+
+	context_set_areg(context, 6, dosbase);
+	context_set_dreg(context, 1, segs);
+	context_set_dreg(context, 2, 4096);
+	context_set_dreg(context, 3, args);
+	context_set_dreg(context, 4, 0);
+
+	deactive_debugger ();
+
 	printf("remote_debug_start_executable\n");
 }
 
