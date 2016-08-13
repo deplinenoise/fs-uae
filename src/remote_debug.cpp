@@ -88,6 +88,7 @@
 extern void debugger_boot();
 
 extern int debug_dma;
+static char s_exe_to_run[4096];
 
 typedef struct dma_info {
 	uae_u32 event;
@@ -879,6 +880,26 @@ static void mem2hex(unsigned char* output, const unsigned char* input, int count
 	*output = 0;
 }
 
+static bool handle_vrun (char* packet) 
+{
+	// extract the args for vRun
+	char* pch = strtok (packet, ";");
+
+	if (pch) {
+		strcpy(s_exe_to_run, pch);
+		pch = strtok (0, pch);
+		printf("exe to run %s\n", s_exe_to_run);
+	}
+
+	debugger_boot ();
+
+	// TODO: Extract args
+
+	send_packet_string ("");
+
+	return true;
+}
+
 static bool handle_multi_letter_packet (char* packet, int length)
 {
 	int i = 0;
@@ -893,13 +914,16 @@ static bool handle_multi_letter_packet (char* packet, int length)
 			break;
 	}
 
-	debugger_boot ();
-
 	// fine to assume that i is valid here as we have already checked that # is present
 
 	packet[i] = 0;
 
-	send_packet_string ("");
+	if (!strcmp(packet, "vRun")) {
+		return handle_vrun (packet + 5);
+	} else {
+
+		send_packet_string ("");
+	}
 
 	return false;
 }
@@ -1166,7 +1190,7 @@ static void update_connection (void)
 	if (fs_emu_is_quitting())
 		return;
 
-	printf("updating connection\n");
+	//printf("updating connection\n");
 
 	// this function will just exit if already connected
 	rconn_update_listner (s_conn);
@@ -1189,7 +1213,7 @@ static void remote_debug_ (void)
 {
 	uaecptr pc = m68k_getpc ();
 
-	printf("update remote-Debug %d\n", s_state);
+	//printf("update remote-Debug %d\n", s_state);
 
 	for (int i = 0; i < s_breakpoint_count; ++i)
 	{
@@ -1455,7 +1479,7 @@ extern uaecptr get_base (const uae_char *name, int offset);
 //
 void remote_debug_start_executable (struct TrapContext *context)
 {
-	uaecptr filename = ds ("dh0:hello");
+	uaecptr filename = ds (s_exe_to_run);
 	uaecptr args = ds ("");
 
 	uaecptr dosbase = get_base ("dos.library", 378);
