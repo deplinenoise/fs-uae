@@ -76,6 +76,9 @@
 #include "traps.h"
 #include "autoconf.h"
 #include "execlib.h"
+#include "uae/debuginfo.h"
+#include "uae/segtracker.h"
+#include "uae.h"
 
 #ifndef INVALID_SOCKET
 #define INVALID_SOCKET -1
@@ -85,8 +88,10 @@
 #define closesocket close
 #endif
 
+
 extern void debugger_boot();
 
+extern int segtracker_enabled;
 extern int debug_dma;
 static char s_exe_to_run[4096];
 
@@ -95,12 +100,19 @@ typedef struct dma_info {
 	uae_u32 type;
 } dma_info;
 
+typedef struct segment_info {
+	uae_u32 address;
+	uae_u32 size;
+} segment_info;
+
 static struct dma_rec* dma_record[2];
 static struct dma_info* dma_info_rec[2];
 static int dma_record_toggle;
 static int live_mode = 0;
 static int debug_dma_frame = 0;
 static int dma_max_sizes[2][2];
+static segment_info s_segment_info[512];
+static int s_segment_count = 0;
 
 #define MAX_BREAKPOINT_COUNT 512
 
@@ -108,6 +120,8 @@ enum DebuggerState
 {
 	Running,
 	Tracing,
+	// Used to step the CPU until we endup in the program we are debugging
+	TraceToProgram,
 };
 
 static DebuggerState s_state = Running;
@@ -864,6 +878,11 @@ static bool step()
 	step_cpu = true;
 	did_step_cpu = true;
 
+	if (s_segment_count > 0) 
+		s_state = TraceToProgram;
+	else
+		s_state = Tracing;
+
 	exception_debugging = 1;
 	return true;
 }
@@ -895,7 +914,6 @@ static bool handle_vrun (char* packet)
 
 	// TODO: Extract args
 
-	send_packet_string ("");
 
 	return true;
 }
@@ -985,6 +1003,14 @@ static void deactive_debugger () {
 	debugger_active = 0;
 	step_cpu = true;
 }
+
+static bool kill_program () {
+	deactive_debugger ();
+	uae_reset (0, 0);
+
+	return true;
+}
+
 
 static bool continue_exec (char* packet)
 {
@@ -1106,6 +1132,8 @@ static bool handle_packet(char* packet, int length)
 {
 	const char command = *packet;
 
+	printf("handle packet %s\n", packet);
+
 	// ‘v’ Packets starting with ‘v’ are identified by a multi-letter name, up to the first ‘;’ or ‘?’ (or the end of the packet).
 
 	if (command == 'v')
@@ -1121,6 +1149,7 @@ static bool handle_packet(char* packet, int length)
 		case 'H' : return handle_thread ();
 		case 'G' : return set_registers ((const uae_u8*)packet + 1);
 		case '?' : return send_exception ();
+		case 'k' : return kill_program ();
 		case 'm' : return send_memory (packet + 1);
 		case 'M' : return set_memory (packet + 1, length - 1);
 		case 'c' : return continue_exec (packet + 1);
@@ -1138,6 +1167,8 @@ static bool parse_packet(char* packet, int size)
 	uae_u8 calc_checksum = 0;
 	uae_u8 read_checksum = 0;
 	int start, end;
+
+	printf("parsing packet %s\n", packet);
 
 	if (*packet == '-' && size == 1)
 	{
@@ -1230,13 +1261,31 @@ static void remote_debug_ (void)
 		}
 	}
 
+	if (s_state == TraceToProgram)
+	{
+		set_special (SPCFLAG_BRK);
+
+		for (int i = 0, end = s_segment_count; i < end; ++i) {
+			const segment_info* seg = &s_segment_info[i];
+			
+			uae_u32 seg_start = seg->address;
+			uae_u32 seg_end = seg->address + seg->size;
+
+			if (pc >= seg_start && pc < seg_end) {
+				//send_exception ();
+				printf("switching to tracing\n");
+				s_state = Tracing;
+				break;
+			}
+		}
+	}
+
 	// Check if we hit some breakpoint and then switch to tracing if we do
 
 	switch (s_state)
 	{
 		case Running:
 		{
-
 			update_connection ();
 			s_socket_update_count = 0;
 
@@ -1276,6 +1325,9 @@ static void remote_debug_ (void)
 
 			break;
 		}
+
+		default:
+			break;
 	}
 }
 
@@ -1489,6 +1541,8 @@ void remote_debug_start_executable (struct TrapContext *context)
 		return;
 	}
 
+	segtracker_clear ();
+
     m68k_dreg (regs, 1) = filename;
 	CallLib (context, dosbase, -150 );
 
@@ -1498,6 +1552,35 @@ void remote_debug_start_executable (struct TrapContext *context)
     	printf("Unable to load segs\n");
     	return;
 	}
+
+	char buffer[1024] = { 0 };
+	strcpy(buffer, "AS");
+
+	// Gather segments from segment tracker so we can send them back to fontend
+	// which needs to know about them to matchup the debug info
+	
+	seglist* sl = segtracker_pool.first;
+	s_segment_count = 0;
+
+	while (sl) {
+		segment *s = sl->segments;
+		while (s->addr) {
+			char temp[64];
+			s_segment_info[s_segment_count].address = s->addr;
+			s_segment_info[s_segment_count].size = s->size;
+			s_segment_count++;
+
+			//sprintf(temp, ";%08x;%d", s->addr, s->size);
+			sprintf(temp, ";%d;%d", s->addr, s->size);
+			strcat(buffer, temp);
+			s++;
+		}
+		sl = sl->next;
+	}
+
+	send_packet_string (buffer);
+
+	printf("segs to send back %s\n", buffer);
 
 	context_set_areg(context, 6, dosbase);
 	context_set_dreg(context, 1, segs);

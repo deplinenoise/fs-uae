@@ -1,4 +1,3 @@
-
 typedef struct {
     uae_u32   addr;
     uae_u32   size;
@@ -28,6 +27,7 @@ extern seglist_pool segtracker_pool;
 
 extern uaecptr segtracker_startup(uaecptr resaddr);
 extern void segtracker_install(void);
+extern void segtracker_add_seglist(const char* name, uae_u32 seglist_addr);
 
 extern void segtracker_dump(const char *match);
 extern int segtracker_search_address(uae_u32 addr, seglist **found_sl, int *num_seg);
