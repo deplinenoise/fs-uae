@@ -289,7 +289,6 @@ static int client_connect (rconn* conn, struct sockaddr_in* host)
 
     // If we got an connection we need to switch to tracing mode directly as this is required by gdb
 
-	s_state = Tracing;
     debug_log("Accept done\n");
 
     return 1;
@@ -451,7 +450,10 @@ static void remote_debug_init_ (int time_out)
 
 struct Breakpoint {
 	uaecptr address;
+	uaecptr seg_address;
+	uaecptr seg_id;
 	bool enabled;
+	bool needs_resolve;
 };
 
 static Breakpoint s_breakpoints[MAX_BREAKPOINT_COUNT];
@@ -878,7 +880,7 @@ static bool step()
 	step_cpu = true;
 	did_step_cpu = true;
 
-	if (s_segment_count > 0) 
+	if (s_segment_count > 0)
 		s_state = TraceToProgram;
 	else
 		s_state = Tracing;
@@ -899,10 +901,12 @@ static void mem2hex(unsigned char* output, const unsigned char* input, int count
 	*output = 0;
 }
 
-static bool handle_vrun (char* packet) 
+static bool handle_vrun (char* packet)
 {
 	// extract the args for vRun
 	char* pch = strtok (packet, ";");
+
+    printf("%s:%d\n", __FILE__, __LINE__);
 
 	if (pch) {
 		strcpy(s_exe_to_run, pch);
@@ -910,10 +914,21 @@ static bool handle_vrun (char* packet)
 		printf("exe to run %s\n", s_exe_to_run);
 	}
 
+	printf("%s:%d\n", __FILE__, __LINE__);
+
+	if (s_segment_count > 0) {
+	    printf("%s:%d\n", __FILE__, __LINE__);
+	    printf("Is a program already running? Skip executing\n");
+	    return true;
+	}
+
+    printf("%s:%d\n", __FILE__, __LINE__);
+
+	printf("running debugger_boot\n");
+
 	debugger_boot ();
 
 	// TODO: Extract args
-
 
 	return true;
 }
@@ -1007,6 +1022,7 @@ static void deactive_debugger () {
 static bool kill_program () {
 	deactive_debugger ();
 	uae_reset (0, 0);
+    s_segment_count = 0;
 
 	return true;
 }
@@ -1049,13 +1065,70 @@ static int has_breakpoint_address(uaecptr address)
 	return -1;
 }
 
+static void resolve_breakpoint_seg_offset (Breakpoint* breakpoint)
+{
+    uaecptr seg_id = breakpoint->seg_id;
+    uaecptr seg_address = breakpoint->seg_address;
+
+    if (seg_id >= s_segment_count)
+    {
+        printf("Segment id >= segment_count (%d - %d)\n", seg_id, s_segment_count);
+        breakpoint->needs_resolve = true;
+        return;
+    }
+
+    breakpoint->address = s_segment_info[seg_id].address + seg_address;
+    breakpoint->needs_resolve = false;
+
+    printf("resolved breakpoint (%x - %x) -> 0x%08x\n", seg_address, seg_id, breakpoint->address);
+}
+
+static bool set_offset_seg_breakpoint (uaecptr address, uae_u32 segment_id, int add)
+{
+    // Remove breakpoint
+
+    if (!add)
+    {
+        for (int i = 0; i < s_breakpoint_count; ++i)
+        {
+            if (s_breakpoints[i].seg_address == address && s_breakpoints[i].seg_id == segment_id) {
+                s_breakpoints[i] = s_breakpoints[s_breakpoint_count - 1];
+                s_breakpoint_count--;
+                return reply_ok ();
+            }
+        }
+    }
+
+	s_breakpoints[s_breakpoint_count].seg_address = address;
+	s_breakpoints[s_breakpoint_count].seg_id = segment_id;
+
+    resolve_breakpoint_seg_offset (&s_breakpoints[s_breakpoint_count]);
+
+	s_breakpoint_count++;
+
+    return reply_ok ();
+}
+
 static bool set_breakpoint_address (char* packet, int add)
 {
 	uaecptr address;
+	uaecptr segment;
 
 	printf("parsing breakpoint\n");
 
-	if (sscanf (packet, "%x,", &address) != 1)
+	// if we have two args it means that the data is of type offset,segment and we need to resolve that.
+	// if we are in running state we try to resolve it directly otherwise we just add it to the list
+	// and resolve it after we loaded the executable
+
+	int scan_res = sscanf (packet, "%x,%d", &address, &segment);
+
+	if (scan_res == 2)
+	{
+	    printf("offset 0x%x seg_id %d\n", address, segment);
+        return set_offset_seg_breakpoint (address, segment, add);
+	}
+
+	if (scan_res != 1)
 	{
 		printf("failed to parse memory packet: %s\n", packet);
 		send_packet_string ("");
@@ -1267,7 +1340,7 @@ static void remote_debug_ (void)
 
 		for (int i = 0, end = s_segment_count; i < end; ++i) {
 			const segment_info* seg = &s_segment_info[i];
-			
+
 			uae_u32 seg_start = seg->address;
 			uae_u32 seg_end = seg->address + seg->size;
 
@@ -1558,7 +1631,7 @@ void remote_debug_start_executable (struct TrapContext *context)
 
 	// Gather segments from segment tracker so we can send them back to fontend
 	// which needs to know about them to matchup the debug info
-	
+
 	seglist* sl = segtracker_pool.first;
 	s_segment_count = 0;
 
@@ -1576,6 +1649,19 @@ void remote_debug_start_executable (struct TrapContext *context)
 			s++;
 		}
 		sl = sl->next;
+	}
+
+	// Resolving breakpoints before we start running. The allows us to have breakpoints before
+	// the execution of the program (such stop at "main")
+
+	for (int i = 0; i < s_breakpoint_count; ++i)
+	{
+	    Breakpoint* bp = &s_breakpoints[i];
+
+	    if (!bp->needs_resolve)
+	        continue;
+
+        resolve_breakpoint_seg_offset (bp);
 	}
 
 	send_packet_string (buffer);
