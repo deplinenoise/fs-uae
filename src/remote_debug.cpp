@@ -454,7 +454,11 @@ struct Breakpoint {
 	uaecptr seg_id;
 	bool enabled;
 	bool needs_resolve;
+	bool temp_break;
 };
+
+// used when skipping an instruction 
+static uaecptr s_skip_to_pc = 0xffffffff;
 
 static Breakpoint s_breakpoints[MAX_BREAKPOINT_COUNT];
 static int s_breakpoint_count = 0;
@@ -889,6 +893,23 @@ static bool step()
 	return true;
 }
 
+static bool step_next_instruction () {
+	uaecptr nextpc = 0;
+	uaecptr pc = m68k_getpc ();
+	m68k_disasm (pc, &nextpc, 1);
+
+	step_cpu = true;
+	did_step_cpu = true;
+	exception_debugging = 1;
+
+	printf("current pc 0x%08x - next pc 0x%08x\n", pc, nextpc);
+
+	s_skip_to_pc = nextpc;
+	s_state = Running;
+
+	return true;
+}
+
 static void mem2hex(unsigned char* output, const unsigned char* input, int count)
 {
 	for (int i = 0; i < count; ++i)
@@ -1219,6 +1240,7 @@ static bool handle_packet(char* packet, int length)
 	{
 		case 'g' : return send_registers ();
 		case 's' : return step ();
+		case 'n' : return step_next_instruction ();
 		case 'H' : return handle_thread ();
 		case 'G' : return set_registers ((const uae_u8*)packet + 1);
 		case '?' : return send_exception ();
@@ -1316,6 +1338,19 @@ static void update_connection (void)
 static void remote_debug_ (void)
 {
 	uaecptr pc = m68k_getpc ();
+
+	// used when stepping over an instruction (useful to skip bsr/jsr/etc)
+
+	if (s_skip_to_pc != 0xffffffff)
+	{
+		set_special (SPCFLAG_BRK);
+
+		if (s_skip_to_pc == pc) {
+			send_exception ();
+			s_state = Tracing;
+			s_skip_to_pc = 0xffffffff; 
+		}
+	}
 
 	//printf("update remote-Debug %d\n", s_state);
 
@@ -1606,6 +1641,15 @@ void remote_debug_start_executable (struct TrapContext *context)
 {
 	uaecptr filename = ds (s_exe_to_run);
 	uaecptr args = ds ("");
+
+	// so this is a hack to say that we aren't running from cli
+
+	m68k_areg (regs, 1) = 0;
+	uae_u32 curr_task = CallLib (context, get_long (4), -0x126); /* FindTask */
+	char* task_ptr = au((char*)get_real_address (get_long (curr_task)));
+
+	// Clear WB message
+	*((uae_u32*)(task_ptr + 0xac)) = 0;
 
 	uaecptr dosbase = get_base ("dos.library", 378);
 
