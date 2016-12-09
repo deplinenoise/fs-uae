@@ -1356,6 +1356,10 @@ static void remote_debug_ (void)
 
 	for (int i = 0; i < s_breakpoint_count; ++i)
 	{
+		if (s_breakpoints[i].needs_resolve) {
+			continue;
+		}
+
 		set_special (SPCFLAG_BRK);
 
 		printf("checking breakpoint %08x - %08x\n", s_breakpoints[i].address, pc);
