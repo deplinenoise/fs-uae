@@ -31,7 +31,7 @@ static patch_func pf_NewLoadSeg;
 #warning Needs strcasestr replacement
 #endif
 
-int segtracker_enabled = 1;
+int segtracker_enabled = 0;
 
 /* patch the interesting DOS functions.
    Since we call exec's SetFunction to perform the patch it will work on

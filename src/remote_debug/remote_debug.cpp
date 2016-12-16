@@ -57,15 +57,12 @@
 #include "traps.h"
 #include "autoconf.h"
 #include "execlib.h"
-#include "uae/debuginfo.h"
-#include "uae/segtracker.h"
 #include "uae.h"
 
 static rconn* s_conn = 0;
 
 extern void debugger_boot();
 
-extern int segtracker_enabled;
 extern int debug_dma;
 static char s_exe_to_run[4096];
 
@@ -1188,12 +1185,12 @@ void remote_debug_start_executable (struct TrapContext *context)
 		return;
 	}
 
-	segtracker_clear ();
-
     m68k_dreg (regs, 1) = filename;
 	CallLib (context, dosbase, -150);
 
+	// Get the segments for the executables (sent to debugger to match up the debug info)
     uaecptr segs = m68k_dreg (regs, 0);
+	uaecptr seglist_addr = segs << 2;
 
     if (segs == 0) {
 		printf("Unable to load segs\n");
@@ -1203,26 +1200,24 @@ void remote_debug_start_executable (struct TrapContext *context)
 	char buffer[1024] = { 0 };
 	strcpy(buffer, "AS");
 
-	// Gather segments from segment tracker so we can send them back to fontend
-	// which needs to know about them to matchup the debug info
-
-	seglist* sl = segtracker_pool.first;
 	s_segment_count = 0;
 
-	while (sl) {
-		segment *s = sl->segments;
-		while (s->addr) {
-			char temp[64];
-			s_segment_info[s_segment_count].address = s->addr;
-			s_segment_info[s_segment_count].size = s->size;
-			s_segment_count++;
+	uae_u32 ptr = seglist_addr;
+	while(ptr != 0) {
+		char temp[64];
 
-			//sprintf(temp, ";%08x;%d", s->addr, s->size);
-			sprintf(temp, ";%d;%d", s->addr, s->size);
-			strcat(buffer, temp);
-			s++;
-		}
-		sl = sl->next;
+		uae_u32 size = get_long(ptr - 4) - 8; // size of BPTR + segment
+		uae_u32 addr = ptr + 4;
+
+		s_segment_info[s_segment_count].address = addr;
+		s_segment_info[s_segment_count].size = size;
+
+		sprintf(temp, ";%d;%d", addr, size);
+		strcat(buffer, temp);
+
+		s_segment_count++;
+
+		ptr = get_long(ptr) << 2; // BPTR to next segment
 	}
 
 	// Resolving breakpoints before we start running. The allows us to have breakpoints before
