@@ -61,10 +61,15 @@
 
 static rconn* s_conn = 0;
 
+extern int debug_illegal;
+extern uae_u64 debug_illegal_mask;
+
 extern void debugger_boot();
 
 extern int debug_dma;
 static char s_exe_to_run[4096];
+
+static int old_active_debugger = 0;
 
 typedef struct dma_info {
 	uae_u32 event;
@@ -265,17 +270,17 @@ static uae_u8* write_reg_double (uae_u8* dest, double v)
 {
     union
     {
-	double fp64;
-	uae_u8 u8[8];
+        double fp64;
+        uae_u8 u8[8];
     } t;
 
     t.fp64 = v;
 
     for (int i = 0; i < 8; ++i)
     {
-	uae_u8 c = t.u8[i];
-	*dest++ = s_hexchars[c >> 4];
-	*dest++ = s_hexchars[c & 0xf];
+        uae_u8 c = t.u8[i];
+        *dest++ = s_hexchars[c >> 4];
+        *dest++ = s_hexchars[c & 0xf];
     }
 
     return dest;
@@ -291,8 +296,8 @@ static bool send_packet_in_place (unsigned char* t, int length)
 
     // + 1 as we calculate the cs one byte into the stream
     for (int i = 1; i < length+1; ++i) {
-	uae_u8 temp = t[i];
-	cs += t[i];
+        uae_u8 temp = t[i];
+        cs += t[i];
     }
 
     t[length + 1] = '#';
@@ -338,6 +343,8 @@ static bool send_registers (void)
     uae_u8* t = registerBuffer;
     uae_u8* buffer = registerBuffer;
 
+    uae_u32 temp;
+
     *buffer++ = '$';
 
     for (int i = 0; i < 8; ++i)
@@ -348,6 +355,8 @@ static bool send_registers (void)
 
     buffer = write_reg_32 (buffer, regs.sr);
     buffer = write_reg_32 (buffer, m68k_getpc ());
+
+    printf("current pc %08x\n", m68k_getpc ());
 
 #ifdef FPUEMU
 	/*
@@ -363,6 +372,8 @@ static bool send_registers (void)
 	*/
 #endif
 
+    printf("sending registers back\n");
+
     return send_packet_in_place(t, (int)((uintptr_t)buffer - (uintptr_t)t) - 1);
 }
 
@@ -376,9 +387,9 @@ static bool send_memory (char* packet)
 
     if (sscanf (packet, "%x,%x:", &address, &size) != 2)
     {
-	printf("failed to parse memory packet: %s\n", packet);
-	send_packet_string ("E01");
-	return false;
+        printf("failed to parse memory packet: %s\n", packet);
+        send_packet_string ("E01");
+        return false;
     }
 
     t = mem = xmalloc(uae_u8, (size * 2) + 7);
@@ -520,7 +531,7 @@ static bool set_registers (const uae_u8* data)
     */
 #endif
 
-    reply_ok();
+    reply_ok ();
 
     return false;
 }
@@ -529,31 +540,37 @@ static bool set_registers (const uae_u8* data)
 static int map_68k_exception(int exception) {
     int sig = 0;
 
+    if (exception == 4) {
+		uae_u32 exception_pc = x_get_long (m68k_areg (regs, 7) + 2);
+		printf("exception pc %08x\n", exception_pc);
+		m68k_setpc (exception_pc);
+    }
+
     switch (exception)
     {
-	case 2: sig = 10; break; // bus error
-	case 3: sig = 10; break; // address error
-	case 4: sig = 4; break; // illegal instruction
-	case 5: sig = 8; break; // zero divide
-	case 6: sig = 8; break; // chk instruction
-	case 7: sig = 8; break; // trapv instruction
-	case 8: sig = 11; break; // privilege violation
-	case 9: sig = 5; break; // trace trap
-	case 10: sig = 4; break; // line 1010 emulator
-	case 11: sig = 4; break; // line 1111 emulator
-	case 13: sig = 10; break; // Coprocessor protocol violation.  Using a standard MMU or FPU this cannot be triggered by software.  Call it a SIGBUS.
-	case 31: sig = 2; break; // interrupt
-	case 33: sig = 5; break; // breakpoint
-	case 34: sig = 5; break; // breakpoint
-	case 40: sig = 8; break; // floating point err
-	case 48: sig = 8; break; // floating point err
-	case 49: sig = 8; break; // floating point err
-	case 50: sig = 8; break; // zero divide
-	case 51: sig = 8; break; // underflow
-	case 52: sig = 8; break; // operand error
-	case 53: sig = 8; break; // overflow
-	case 54: sig = 8; break; // NAN
-	default: sig = 7; // "software generated"
+        case 2: sig = 10; break; // bus error
+        case 3: sig = 10; break; // address error
+        case 4: sig = 4; break; // illegal instruction
+        case 5: sig = 8; break; // zero divide
+        case 6: sig = 8; break; // chk instruction
+        case 7: sig = 8; break; // trapv instruction
+        case 8: sig = 11; break; // privilege violation
+        case 9: sig = 5; break; // trace trap
+        case 10: sig = 4; break; // line 1010 emulator
+        case 11: sig = 4; break; // line 1111 emulator
+        case 13: sig = 10; break; // Coprocessor protocol violation.  Using a standard MMU or FPU this cannot be triggered by software.  Call it a SIGBUS.
+        case 31: sig = 2; break; // interrupt
+        case 33: sig = 5; break; // breakpoint
+        case 34: sig = 5; break; // breakpoint
+        case 40: sig = 8; break; // floating point err
+        case 48: sig = 8; break; // floating point err
+        case 49: sig = 8; break; // floating point err
+        case 50: sig = 8; break; // zero divide
+        case 51: sig = 8; break; // underflow
+        case 52: sig = 8; break; // operand error
+        case 53: sig = 8; break; // overflow
+        case 54: sig = 8; break; // NAN
+        default: sig = 7; // "software generated"
     }
 
     return sig;
@@ -564,7 +581,7 @@ static bool send_exception (void) {
 
 	unsigned char buffer[16] = { 0 };
 
-	printf("send exception\n");
+	printf("send exception %d\n", regs.exception);
 
 	int sig = map_68k_exception (regs.exception);
 
@@ -586,6 +603,8 @@ static bool step()
 		s_state = TraceToProgram;
 	else
 		s_state = Tracing;
+
+    activate_debugger ();
 
 	exception_debugging = 1;
 	return true;
@@ -729,6 +748,8 @@ static void deactive_debugger () {
 	s_state = Running;
 	exception_debugging = 0;
 	debugger_active = 0;
+    old_active_debugger = 0;
+
 	step_cpu = true;
 }
 
@@ -1060,6 +1081,7 @@ static void remote_debug_ (void)
 
 		if (s_breakpoints[i].address == pc)
 		{
+			//activate_debugger ();
 			send_exception ();
 			printf("switching to tracing\n");
 			s_state = Tracing;
@@ -1084,6 +1106,13 @@ static void remote_debug_ (void)
 			}
 		}
 	}
+
+	if (debugger_active == 1 && old_active_debugger == 0) {
+        did_step_cpu = true;
+        step_cpu = false;
+        s_state = Tracing;
+        old_active_debugger = 1;
+    }
 
 	// Check if we hit some breakpoint and then switch to tracing if we do
 
@@ -1146,7 +1175,6 @@ static void remote_debug_update_ (void)
 	rconn_update_listner (s_conn);
 
 	remote_debug_ ();
-	activate_debugger ();
 
 	if (rconn_poll_read(s_conn)) {
 		activate_debugger ();
@@ -1168,6 +1196,11 @@ void remote_debug_start_executable (struct TrapContext *context)
 {
 	uaecptr filename = ds (s_exe_to_run);
 	uaecptr args = ds ("");
+
+	debug_illegal = 1;
+
+	// trap illegal
+	debug_illegal_mask = 1 << 4;
 
 	// so this is a hack to say that we aren't running from cli
 
