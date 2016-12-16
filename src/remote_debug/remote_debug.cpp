@@ -457,7 +457,7 @@ struct Breakpoint {
 	bool temp_break;
 };
 
-// used when skipping an instruction 
+// used when skipping an instruction
 static uaecptr s_skip_to_pc = 0xffffffff;
 
 static Breakpoint s_breakpoints[MAX_BREAKPOINT_COUNT];
@@ -1348,7 +1348,7 @@ static void remote_debug_ (void)
 		if (s_skip_to_pc == pc) {
 			send_exception ();
 			s_state = Tracing;
-			s_skip_to_pc = 0xffffffff; 
+			s_skip_to_pc = 0xffffffff;
 		}
 	}
 
@@ -1362,7 +1362,7 @@ static void remote_debug_ (void)
 
 		set_special (SPCFLAG_BRK);
 
-		printf("checking breakpoint %08x - %08x\n", s_breakpoints[i].address, pc);
+		//printf("checking breakpoint %08x - %08x\n", s_breakpoints[i].address, pc);
 
 		if (s_breakpoints[i].address == pc)
 		{
@@ -1487,6 +1487,7 @@ static void rec_dma_event (int evt, int hpos, int vpos)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 static void rec_dma_reset (void)
 {
