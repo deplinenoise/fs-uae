@@ -236,6 +236,7 @@ libuae_a_SOURCES = \
 	src/custom.cpp \
 	src/debug.cpp \
 	src/debuginfo.cpp \
+	src/remote_debug/remote_debug_conn.cpp \
 	src/remote_debug/remote_debug.cpp \
 	src/def_icons.cpp \
 	src/devices.cpp \

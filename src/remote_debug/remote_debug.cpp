@@ -4,7 +4,7 @@
 //
 // (c) 1995 Bernd Schmidt
 // (c) 2006 Toni Wilen
-// (c) 2016 Daniel Collin (this file: GDB Implementation/remote debugger interface)
+// (c) 2016-2007 Daniel Collin (files remote_debug_* Semi GDB Implementation/remote debugger interface)
 //
 // This implementation is done from scratch and doesn't use any existing gdb-stub code.
 // The idea is to supply a fairly minimal implementation in order to reduce maintaince.
@@ -23,6 +23,7 @@
 //
 // TODO: List and implement extensions
 //
+// DMA extent not really working yet
 //-----------------
 //
 // QDmaLine
@@ -39,30 +40,10 @@
 #include "remote_debug.h"
 #ifdef REMOTE_DEBUGGER
 
+#include "remote_debug_conn.h"
+
 #include <string.h>
 #include <stdint.h>
-#if defined(_MSC_VER)
-#pragma warning(disable: 4496)
-#include <winsock2.h>
-#pragma warning(default: 4496)
-#include <winsock2.h>
-#include <Ws2tcpip.h>
-#endif
-
-#if !defined(_WIN32)
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#endif
-
-#if defined(__linux__)
-#include <sys/time.h>
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -80,14 +61,7 @@
 #include "uae/segtracker.h"
 #include "uae.h"
 
-#ifndef INVALID_SOCKET
-#define INVALID_SOCKET -1
-#endif
-
-#if !defined(_WIN32)
-#define closesocket close
-#endif
-
+static rconn* s_conn = 0;
 
 extern void debugger_boot();
 
@@ -105,9 +79,6 @@ typedef struct segment_info {
 	uae_u32 size;
 } segment_info;
 
-static struct dma_rec* dma_record[2];
-static struct dma_info* dma_info_rec[2];
-static int dma_record_toggle;
 static int live_mode = 0;
 static int debug_dma_frame = 0;
 static int dma_max_sizes[2][2];
@@ -118,10 +89,10 @@ static int s_segment_count = 0;
 
 enum DebuggerState
 {
-	Running,
-	Tracing,
-	// Used to step the CPU until we endup in the program we are debugging
-	TraceToProgram,
+    Running,
+    Tracing,
+    // Used to step the CPU until we endup in the program we are debugging
+    TraceToProgram,
 };
 
 static DebuggerState s_state = Running;
@@ -134,286 +105,16 @@ static bool step_cpu = false;
 static bool did_step_cpu = false;
 static uae_u8 s_lastSent[1024];
 static int s_lastSize = 0;
-static bool need_ack = true;
 static unsigned int s_socket_update_count = 0;
 
+bool need_ack = true;
+
 extern "C" {
-	int fs_emu_is_quitting();
-	int remote_debugging = 0;
+    int fs_emu_is_quitting();
+    int remote_debugging = 0;
 }
 
 #define DEBUG_LOG
-
-enum ConnectionType
-{
-    ConnectionType_Listener,
-    ConnectionType_Connect
-};
-
-typedef struct rconn
-{
-    enum ConnectionType type;
-
-    int server_socket;     // used when having a listener socket
-    int socket;
-
-} rconn;
-
-void debug_log (const char* fmt, ...)
-{
-#ifdef DEBUG_LOG
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
-#else
-    (void)fmt;
-#endif
-}
-
-static int socket_poll (int socket)
-{
-    struct timeval to = { 0, 0 };
-    fd_set fds;
-
-    FD_ZERO(&fds);
-
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable: 4127)
-#endif
-    FD_SET(socket, &fds);
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-    return select (socket + 1, &fds, NULL, NULL, &to) > 0;
-}
-
-static int create_listner (rconn* conn, int port)
-{
-    struct sockaddr_in sin;
-    int yes = 1;
-
-    conn->server_socket = (int)socket (AF_INET, SOCK_STREAM, 0);
-
-    if (conn->server_socket == INVALID_SOCKET)
-        return 0;
-
-    memset(&sin, 0, sizeof sin);
-
-    sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = INADDR_ANY;
-    sin.sin_port = htons((unsigned short)port);
-
-    if (setsockopt (conn->server_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(int)) == -1) {
-        perror("setsockopt");
-        return 0;
-    }
-
-    if (-1 == bind (conn->server_socket, (struct sockaddr*)&sin, sizeof(sin))) {
-        perror("bind");
-        return 0;
-    }
-
-    while (listen(conn->server_socket, SOMAXCONN) == -1)
-        ;
-
-    debug_log("created listener\n");
-
-    return 1;
-}
-
-static struct rconn* rconn_create (enum ConnectionType type, int port)
-{
-    rconn* conn = 0;
-
-#if defined(_WIN32)
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 0), &wsaData) != 0)
-        return 0;
-#endif
-
-    conn = xmalloc(struct rconn, 1);
-
-    conn->type = type;
-    conn->server_socket = INVALID_SOCKET;
-    conn->socket = INVALID_SOCKET;
-
-    if (type == ConnectionType_Listener) {
-        if (!create_listner(conn, port)) {
-            xfree(conn);
-            return 0;
-        }
-    }
-
-    return conn;
-}
-
-static void rconn_destroy (struct rconn* conn)
-{
-	if (!conn)
-		return;
-
-    if (conn->socket != INVALID_SOCKET)
-        closesocket(conn->socket);
-
-    if (conn->server_socket != INVALID_SOCKET)
-        closesocket(conn->server_socket);
-
-    xfree(conn);
-}
-
-static int rconn_connected (struct rconn* conn)
-{
-    return conn->socket != INVALID_SOCKET;
-}
-
-static int client_connect (rconn* conn, struct sockaddr_in* host)
-{
-    struct sockaddr_in hostTemp;
-    unsigned int hostSize = sizeof(struct sockaddr_in);
-
-    debug_log("Trying to accept\n");
-
-    conn->socket = (int)accept (conn->server_socket, (struct sockaddr*)&hostTemp, (socklen_t*)&hostSize);
-
-    if (INVALID_SOCKET == conn->socket) {
-        perror("accept");
-        debug_log("Unable to accept connection..\n");
-        return 0;
-    }
-
-    if (NULL != host)
-        *host = hostTemp;
-
-    // If we got an connection we need to switch to tracing mode directly as this is required by gdb
-
-    debug_log("Accept done\n");
-
-    return 1;
-}
-
-static int rconn_is_connected (rconn* conn)
-{
-    if (conn == NULL)
-        return 0;
-
-    return conn->socket != INVALID_SOCKET;
-}
-
-static void rconn_update_listner (rconn* conn)
-{
-    struct timeval timeout;
-    struct sockaddr_in client;
-    fd_set fds;
-
-    FD_ZERO(&fds);
-
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable: 4127)
-#endif
-    FD_SET (conn->server_socket, &fds);
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 0;
-
-    if (rconn_is_connected (conn))
-        return;
-
-    // look for new clients
-
-    if (select (conn->server_socket + 1, &fds, NULL, NULL, &timeout) > 0)
-    {
-        if (client_connect (conn, &client))
-            debug_log ("Connected to %s\n", inet_ntoa(client.sin_addr));
-    }
-}
-
-static int rconn_disconnect (rconn* conn)
-{
-    debug_log("Disconnected\n");
-
-	// reset the ack mode if client disconnected
-	need_ack = true;
-
-    if (conn->socket != INVALID_SOCKET)
-        closesocket(conn->socket);
-
-    debug_log("set invalid socket\n");
-
-    conn->socket = INVALID_SOCKET;
-
-    return 1;
-}
-
-static int rconn_recv (rconn* conn, char* buffer, int length, int flags)
-{
-    int ret;
-
-    if (!rconn_connected(conn))
-        return 0;
-
-    ret = (int)recv(conn->socket, buffer, (size_t)length, flags);
-
-    printf("recv %d\n", ret);
-
-    if (ret <= 0)
-    {
-        debug_log("recv %d %d\n", ret, length);
-        rconn_disconnect(conn);
-        return 0;
-    }
-
-    return ret;
-}
-
-static int rconn_send(rconn* conn, const void* buffer, int length, int flags)
-{
-    int ret;
-
-    if (!rconn_connected(conn))
-        return 0;
-
-#if 0
-	printf("About to send\n");
-
-	char* c = (char*)buffer;
-
-	for (int i = 0; i < length; ++i)
-		printf("%c", c[i]);
-
-	printf("\n");
-#endif
-
-    if ((ret = (int)send(conn->socket, buffer, (size_t)length, flags)) != (int)length)
-    {
-    	printf("disconnected because length doesn't match (expected %d but got %d)\n", length, ret);
-        rconn_disconnect(conn);
-        return 0;
-    }
-
-    // take a copy of what we sent last if we need to resend it
-
-	//memcpy (s_lastSent, buffer, length);
-	s_lastSize = 0;
-
-    return ret;
-}
-
-static int rconn_poll_read(rconn* conn)
-{
-    if (!rconn_connected(conn))
-        return 0;
-
-    return !!socket_poll(conn->socket);
-}
-
-static rconn* s_conn = 0;
 
 //
 // time_out allows to set the time UAE will wait at startup for a connection.
@@ -423,38 +124,38 @@ static rconn* s_conn = 0;
 
 static void remote_debug_init_ (int time_out)
 {
-	if (s_conn || time_out < 0)
-		return;
+    if (s_conn || time_out < 0)
+	    return;
 
-	printf("creating connection...\n");
+    printf("creating connection...\n");
 
-	if (!(s_conn = rconn_create (ConnectionType_Listener, 6860)))
-		return;
+    if (!(s_conn = rconn_create (ConnectionType_Listener, 6860)))
+	    return;
 
-	printf("remote debugger active\n");
+    printf("remote debugger active\n");
 
-	remote_debugging = 1;
+    remote_debugging = 1;
 
-	// if time_out > 0 we wait that number of seconds for a connection to be made. If
-	// none has been done within the given time-frame we just continue
+    // if time_out > 0 we wait that number of seconds for a connection to be made. If
+    // none has been done within the given time-frame we just continue
 
-	for (int i = 0; i < time_out * 10; i++) {
+    for (int i = 0; i < time_out * 10; i++) {
 		rconn_update_listner (s_conn);
 
 		if (rconn_is_connected (s_conn))
 			return;
 
 		sleep_millis (100);	// sleep for 100 ms to not hammer on the socket while waiting
-	}
+    }
 }
 
 struct Breakpoint {
-	uaecptr address;
-	uaecptr seg_address;
-	uaecptr seg_id;
-	bool enabled;
-	bool needs_resolve;
-	bool temp_break;
+    uaecptr address;
+    uaecptr seg_address;
+    uaecptr seg_id;
+    bool enabled;
+    bool needs_resolve;
+    bool temp_break;
 };
 
 // used when skipping an instruction
@@ -465,26 +166,26 @@ static int s_breakpoint_count = 0;
 
 static int hex(char ch)
 {
-	if ((ch >= 'a') && (ch <= 'f'))
-		return ch - 'a' + 10;
+    if ((ch >= 'a') && (ch <= 'f'))
+	    return ch - 'a' + 10;
 
-	if ((ch >= '0') && (ch <= '9'))
-		return ch - '0';
+    if ((ch >= '0') && (ch <= '9'))
+	    return ch - '0';
 
-	if ((ch >= 'A') && (ch <= 'F'))
-		return ch - 'A' + 10;
+    if ((ch >= 'A') && (ch <= 'F'))
+	    return ch - 'A' + 10;
 
-	return -1;
+    return -1;
 }
 
 const int find_marker(const char* packet, const int offset, const char c, const int length)
 {
-	for (int i = 0; i < length; ++i) {
-		if (packet[i] == c)
-			return i;
-	}
+    for (int i = 0; i < length; ++i) {
+	    if (packet[i] == c)
+		    return i;
+    }
 
-	return -1;
+    return -1;
 }
 
 static const char s_hexchars [] = "0123456789abcdef";
@@ -492,21 +193,21 @@ static const char* s_ok = "$OK#9a";
 
 static int safe_addr (uaecptr addr, int size)
 {
-	addrbank* ab = &get_mem_bank (addr);
+    addrbank* ab = &get_mem_bank (addr);
 
-	if (!ab)
-		return 0;
+    if (!ab)
+	    return 0;
 
-	if (ab->flags & ABFLAG_SAFE)
-		return 1;
+    if (ab->flags & ABFLAG_SAFE)
+	    return 1;
 
-	if (!ab->check (addr, size))
-		return 0;
+    if (!ab->check (addr, size))
+	    return 0;
 
-	if (ab->flags & (ABFLAG_RAM | ABFLAG_ROM | ABFLAG_ROMIN | ABFLAG_SAFE))
-		return 1;
+    if (ab->flags & (ABFLAG_RAM | ABFLAG_ROM | ABFLAG_ROMIN | ABFLAG_SAFE))
+	    return 1;
 
-	return 0;
+    return 0;
 }
 
 static bool reply_ok()
@@ -536,49 +237,49 @@ static uae_u8* write_reg_32 (unsigned char* dest, uae_u32 v)
 
 static uae_u8* write_u16 (unsigned char* dest, uae_u16 v)
 {
-	uae_u8 c0 = (v >> 8) & 0xff;
-	uae_u8 c1 = (v >> 0) & 0xff;
+    uae_u8 c0 = (v >> 8) & 0xff;
+    uae_u8 c1 = (v >> 0) & 0xff;
 
-	dest[0] = s_hexchars[c0 >> 4];
-	dest[1] = s_hexchars[c0 & 0xf];
-	dest[2] = s_hexchars[c1 >> 4];
-	dest[3] = s_hexchars[c1 & 0xf];
+    dest[0] = s_hexchars[c0 >> 4];
+    dest[1] = s_hexchars[c0 & 0xf];
+    dest[2] = s_hexchars[c1 >> 4];
+    dest[3] = s_hexchars[c1 & 0xf];
 
-	return dest + 4;
+    return dest + 4;
 }
 
 static uae_u8* write_u8 (unsigned char* dest, uae_u8 v)
 {
-	dest[0] = s_hexchars[v >> 4];
-	dest[1] = s_hexchars[v & 0xf];
+    dest[0] = s_hexchars[v >> 4];
+    dest[1] = s_hexchars[v & 0xf];
 
-	return dest + 2;
+    return dest + 2;
 }
 
 static uae_u8* write_string (unsigned char* dest, const char* name)
 {
-	int len = strlen(name);
-	memcpy(dest, name, len);
-	return dest + len;
+    int len = strlen(name);
+    memcpy(dest, name, len);
+    return dest + len;
 }
 
 
 static uae_u8* write_reg_double (uae_u8* dest, double v)
 {
-	union
-	{
-		double fp64;
-		uae_u8 u8[8];
-	} t;
+    union
+    {
+	double fp64;
+	uae_u8 u8[8];
+    } t;
 
-	t.fp64 = v;
+    t.fp64 = v;
 
-	for (int i = 0; i < 8; ++i)
-	{
-		uae_u8 c = t.u8[i];
-		*dest++ = s_hexchars[c >> 4];
-		*dest++ = s_hexchars[c & 0xf];
-	}
+    for (int i = 0; i < 8; ++i)
+    {
+	uae_u8 c = t.u8[i];
+	*dest++ = s_hexchars[c >> 4];
+	*dest++ = s_hexchars[c & 0xf];
+    }
 
     return dest;
 }
@@ -589,67 +290,67 @@ static uae_u8* write_reg_double (uae_u8* dest, double v)
 
 static bool send_packet_in_place (unsigned char* t, int length)
 {
-	uae_u8 cs = 0;
+    uae_u8 cs = 0;
 
-	// + 1 as we calculate the cs one byte into the stream
-	for (int i = 1; i < length+1; ++i) {
-		uae_u8 temp = t[i];
-		cs += t[i];
-	}
+    // + 1 as we calculate the cs one byte into the stream
+    for (int i = 1; i < length+1; ++i) {
+	uae_u8 temp = t[i];
+	cs += t[i];
+    }
 
-	t[length + 1] = '#';
-	t[length + 2] = s_hexchars[cs >> 4];
-	t[length + 3] = s_hexchars[cs & 0xf];
-	t[length + 4] = 0;
+    t[length + 1] = '#';
+    t[length + 2] = s_hexchars[cs >> 4];
+    t[length + 3] = s_hexchars[cs & 0xf];
+    t[length + 4] = 0;
 
-	//printf("[<----] <inplace>\n");
-	//printf("[<----] %s\n", t);
+    //printf("[<----] <inplace>\n");
+    //printf("[<----] %s\n", t);
 
-	return rconn_send(s_conn, t, length + 4, 0) == length + 4;
+    return rconn_send(s_conn, t, length + 4, 0) == length + 4;
 }
 
 static void send_packet_string (const char* string)
 {
-	uae_u8* s;
-	uae_u8* t;
-	uae_u8 cs = 0;
-	int len = (int)strlen (string);
-	s = t = xmalloc (uae_u8, len + 5);
+    uae_u8* s;
+    uae_u8* t;
+    uae_u8 cs = 0;
+    int len = (int)strlen (string);
+    s = t = xmalloc (uae_u8, len + 5);
 
-	for (int i = 0; i < len; ++i)
-		cs += string[i];
+    for (int i = 0; i < len; ++i)
+	    cs += string[i];
 
-	*t++ = '$';
-	memcpy (t, string, len);
+    *t++ = '$';
+    memcpy (t, string, len);
 
-	t[len + 0] = '#';
-	t[len + 1] = s_hexchars[cs >> 4];
-	t[len + 2] = s_hexchars[cs & 0xf];
-	t[len + 3] = 0;
+    t[len + 0] = '#';
+    t[len + 1] = s_hexchars[cs >> 4];
+    t[len + 2] = s_hexchars[cs & 0xf];
+    t[len + 3] = 0;
 
-	rconn_send(s_conn, s, len + 4, 0);
+    rconn_send(s_conn, s, len + 4, 0);
 
-	printf("[<----] %s\n", s);
+    printf("[<----] %s\n", s);
 
-	xfree(s);
+    xfree(s);
 }
 
 static bool send_registers (void)
 {
-	uae_u8 registerBuffer[((18 * 4) + (8 * 8)) + (3 * 4) + 5 + 1] = { 0 }; // 16+2 regs + 8 (optional) FPU regs + 3 FPU control regs + space for tags
-	uae_u8* t = registerBuffer;
-	uae_u8* buffer = registerBuffer;
+    uae_u8 registerBuffer[((18 * 4) + (8 * 8)) + (3 * 4) + 5 + 1] = { 0 }; // 16+2 regs + 8 (optional) FPU regs + 3 FPU control regs + space for tags
+    uae_u8* t = registerBuffer;
+    uae_u8* buffer = registerBuffer;
 
-	*buffer++ = '$';
+    *buffer++ = '$';
 
-	for (int i = 0; i < 8; ++i)
-		buffer = write_reg_32 (buffer, m68k_dreg (regs, i));
+    for (int i = 0; i < 8; ++i)
+	    buffer = write_reg_32 (buffer, m68k_dreg (regs, i));
 
-	for (int i = 0; i < 8; ++i)
-		buffer = write_reg_32 (buffer, m68k_areg (regs, i));
+    for (int i = 0; i < 8; ++i)
+	    buffer = write_reg_32 (buffer, m68k_areg (regs, i));
 
-	buffer = write_reg_32 (buffer, regs.sr);
-	buffer = write_reg_32 (buffer, m68k_getpc ());
+    buffer = write_reg_32 (buffer, regs.sr);
+    buffer = write_reg_32 (buffer, m68k_getpc ());
 
 #ifdef FPUEMU
 	/*
@@ -665,114 +366,114 @@ static bool send_registers (void)
 	*/
 #endif
 
-	return send_packet_in_place(t, (int)((uintptr_t)buffer - (uintptr_t)t) - 1);
+    return send_packet_in_place(t, (int)((uintptr_t)buffer - (uintptr_t)t) - 1);
 }
 
 static bool send_memory (char* packet)
 {
-	uae_u8* t;
-	uae_u8* mem;
+    uae_u8* t;
+    uae_u8* mem;
 
-	uaecptr address;
-	int size;
+    uaecptr address;
+    int size;
 
-	if (sscanf (packet, "%x,%x:", &address, &size) != 2)
-	{
-		printf("failed to parse memory packet: %s\n", packet);
-		send_packet_string ("E01");
-		return false;
-	}
+    if (sscanf (packet, "%x,%x:", &address, &size) != 2)
+    {
+	printf("failed to parse memory packet: %s\n", packet);
+	send_packet_string ("E01");
+	return false;
+    }
 
-	t = mem = xmalloc(uae_u8, (size * 2) + 7);
+    t = mem = xmalloc(uae_u8, (size * 2) + 7);
 
-	*t++ = '$';
+    *t++ = '$';
 
-	for (int i = 0; i < size; ++i)
-	{
-		uae_u8 v = '?';
+    for (int i = 0; i < size; ++i)
+    {
+	uae_u8 v = '?';
 
-		if (safe_addr (address, 1))
-			v = get_byte (address);
+	if (safe_addr (address, 1))
+		v = get_byte (address);
 
-		t[0] = s_hexchars[v >> 4];
-		t[1] = s_hexchars[v & 0xf];
+	t[0] = s_hexchars[v >> 4];
+	t[1] = s_hexchars[v & 0xf];
 
-		address++; t += 2;
-	}
+	address++; t += 2;
+    }
 
-	send_packet_in_place(mem, size * 2);
+    send_packet_in_place(mem, size * 2);
 
-	xfree(mem);
+    xfree(mem);
 
-	return true;
+    return true;
 }
 
 bool set_memory (char* packet, int packet_length)
 {
-	uae_u8* t;
-	uae_u8* mem;
+    uae_u8* t;
+    uae_u8* mem;
 
-	uaecptr address;
-	int size;
-	int memory_start = 0;
+    uaecptr address;
+    int size;
+    int memory_start = 0;
 
-	if (sscanf (packet, "%x,%x:", &address, &size) != 2) {
-		printf("failed to parse set_memory packet: %s\n", packet);
-		send_packet_string ("E01");
-		return false;
+    if (sscanf (packet, "%x,%x:", &address, &size) != 2) {
+	printf("failed to parse set_memory packet: %s\n", packet);
+	send_packet_string ("E01");
+	return false;
+    }
+
+    for (int i = 0; i < packet_length; ++i) {
+	const uae_u8 t = packet[i];
+
+	if (t == ':' || t == '#') {
+	    memory_start = i + 1;
+	    break;
+	}
+    }
+
+    if (memory_start == 0) {
+	printf ("Unable to find end tag for packet %s\n", packet);
+	send_packet_string ("E01");
+	return false;
+    }
+
+    packet += memory_start;
+
+    printf ("memory start %d - %s\n", memory_start, packet);
+
+    for (int i = 0; i < size; ++i)
+    {
+	if (!safe_addr (address, 1)) {
+	    send_packet_string ("E01");
+	    return false;
 	}
 
-	for (int i = 0; i < packet_length; ++i) {
-		const uae_u8 t = packet[i];
+	uae_u8 t = hex(packet[0]) << 4 | hex(packet[1]);
 
-		if (t == ':' || t == '#') {
-			memory_start = i + 1;
-			break;
-		}
-	}
+	printf("setting memory %x-%x [%x] to %x\n", packet[0], packet[1], t, address);
+	packet += 2;
 
-	if (memory_start == 0) {
-		printf ("Unable to find end tag for packet %s\n", packet);
-		send_packet_string ("E01");
-		return false;
-	}
+	put_byte (address++, t);
+    }
 
-	packet += memory_start;
-
-	printf ("memory start %d - %s\n", memory_start, packet);
-
-	for (int i = 0; i < size; ++i)
-	{
-		if (!safe_addr (address, 1)) {
-			send_packet_string ("E01");
-			return false;
-		}
-
-		uae_u8 t = hex(packet[0]) << 4 | hex(packet[1]);
-
-		printf("setting memory %x-%x [%x] to %x\n", packet[0], packet[1], t, address);
-		packet += 2;
-
-		put_byte (address++, t);
-	}
-
-	return reply_ok ();
+    return reply_ok ();
 }
 
 static uae_u32 get_u32 (const uae_u8** data)
 {
-	const uae_u8* temp = *data;
+    const uae_u8* temp = *data;
 
-	uae_u32 t[4];
+    uae_u32 t[4];
 
-	for (int i = 0; i < 4; ++i) {
-		t[i] = hex(temp[0]) << 4 | hex(temp[1]);
-		temp += 2;
-	}
+    for (int i = 0; i < 4; ++i) {
+	t[i] = hex(temp[0]) << 4 | hex(temp[1]);
+	temp += 2;
+    }
 
-	*data = temp;
+    *data = temp;
 
-	return (t[0] << 24) | (t[1] << 16) | (t[2] << 8) | t[3];
+    return (t[0] << 24) | (t[1] << 16) | (t[2] << 8) | t[3];
 }
 
 static uae_u32 get_double (const uae_u8** data)
@@ -780,13 +481,13 @@ static uae_u32 get_double (const uae_u8** data)
 	const uae_u8* temp = *data;
 
 	union {
-		double d;
-		uae_u8 u8[4];
+	    double d;
+	    uae_u8 u8[4];
 	} t;
 
 	for (int i = 0; i < 8; ++i) {
-		t.u8[i] = hex(temp[0]) << 4 | hex(temp[1]);
-		temp += 2;
+	    t.u8[i] = hex(temp[0]) << 4 | hex(temp[1]);
+	    temp += 2;
 	}
 
 	*data = temp;
@@ -796,69 +497,69 @@ static uae_u32 get_double (const uae_u8** data)
 
 static bool set_registers (const uae_u8* data)
 {
-	// order of registers are assumed to be
-	// d0-d7, a0-a7, sr, pc [optional fp0-fp7, control, sr, iar)
+    // order of registers are assumed to be
+    // d0-d7, a0-a7, sr, pc [optional fp0-fp7, control, sr, iar)
 
-	for (int i = 0; i < 8; ++i)
-		m68k_dreg (regs, i) = get_u32(&data);
+    for (int i = 0; i < 8; ++i)
+	m68k_dreg (regs, i) = get_u32(&data);
 
-	for (int i = 0; i < 8; ++i)
-		m68k_areg (regs, i) = get_u32(&data);
+    for (int i = 0; i < 8; ++i)
+	m68k_areg (regs, i) = get_u32(&data);
 
-	regs.sr = get_u32 (&data);
-	regs.pc = get_u32 (&data);
+    regs.sr = get_u32 (&data);
+    regs.pc = get_u32 (&data);
 
 #ifdef FPUEMU
-	/*
-	if (currprefs.fpu_model)
-	{
-		for (int i = 0; i < 8; ++i)
-			regs.fp[i].fp = get_double (&data);
+    /*
+    if (currprefs.fpu_model)
+    {
+	for (int i = 0; i < 8; ++i)
+		regs.fp[i].fp = get_double (&data);
 
-		regs.fpcr = get_u32 (&data);
-		regs.fpsr = get_u32 (&data);
-		regs.fpiar = get_u32 (&data);
-	}
-	*/
+	regs.fpcr = get_u32 (&data);
+	regs.fpsr = get_u32 (&data);
+	regs.fpiar = get_u32 (&data);
+    }
+    */
 #endif
 
-	reply_ok();
+    reply_ok();
 
-	return false;
+    return false;
 }
 
 
 static int map_68k_exception(int exception) {
-	int sig = 0;
+    int sig = 0;
 
-	switch (exception)
-	{
-		case 2: sig = 10; break; // bus error
-		case 3: sig = 10; break; // address error
-		case 4: sig = 4; break; // illegal instruction
-		case 5: sig = 8; break; // zero divide
-		case 6: sig = 8; break; // chk instruction
-		case 7: sig = 8; break; // trapv instruction
-		case 8: sig = 11; break; // privilege violation
-		case 9: sig = 5; break; // trace trap
-		case 10: sig = 4; break; // line 1010 emulator
-		case 11: sig = 4; break; // line 1111 emulator
-		case 13: sig = 10; break; // Coprocessor protocol violation.  Using a standard MMU or FPU this cannot be triggered by software.  Call it a SIGBUS.
-		case 31: sig = 2; break; // interrupt
-		case 33: sig = 5; break; // breakpoint
-		case 34: sig = 5; break; // breakpoint
-		case 40: sig = 8; break; // floating point err
-		case 48: sig = 8; break; // floating point err
-		case 49: sig = 8; break; // floating point err
-		case 50: sig = 8; break; // zero divide
-		case 51: sig = 8; break; // underflow
-		case 52: sig = 8; break; // operand error
-		case 53: sig = 8; break; // overflow
-		case 54: sig = 8; break; // NAN
-		default: sig = 7; // "software generated"
-	}
+    switch (exception)
+    {
+	case 2: sig = 10; break; // bus error
+	case 3: sig = 10; break; // address error
+	case 4: sig = 4; break; // illegal instruction
+	case 5: sig = 8; break; // zero divide
+	case 6: sig = 8; break; // chk instruction
+	case 7: sig = 8; break; // trapv instruction
+	case 8: sig = 11; break; // privilege violation
+	case 9: sig = 5; break; // trace trap
+	case 10: sig = 4; break; // line 1010 emulator
+	case 11: sig = 4; break; // line 1111 emulator
+	case 13: sig = 10; break; // Coprocessor protocol violation.  Using a standard MMU or FPU this cannot be triggered by software.  Call it a SIGBUS.
+	case 31: sig = 2; break; // interrupt
+	case 33: sig = 5; break; // breakpoint
+	case 34: sig = 5; break; // breakpoint
+	case 40: sig = 8; break; // floating point err
+	case 48: sig = 8; break; // floating point err
+	case 49: sig = 8; break; // floating point err
+	case 50: sig = 8; break; // zero divide
+	case 51: sig = 8; break; // underflow
+	case 52: sig = 8; break; // operand error
+	case 53: sig = 8; break; // overflow
+	case 54: sig = 8; break; // NAN
+	default: sig = 7; // "software generated"
+    }
 
-	return sig;
+    return sig;
 }
 
 
@@ -935,7 +636,7 @@ static bool handle_vrun (char* packet)
 		printf("exe to run %s\n", s_exe_to_run);
 	}
 
-	printf("%s:%d\n", __FILE__, __LINE__);
+	//printf("%s:%d\n", __FILE__, __LINE__);
 
 	if (s_segment_count > 0) {
 	    printf("%s:%d\n", __FILE__, __LINE__);
@@ -1009,12 +710,6 @@ static bool handle_query_packet(char* packet, int length)
 	else if (!strcmp (packet, "qSupported")) {
 		printf("handle_query_packet %d\n", __LINE__);
 		send_packet_string ("QStartNoAckMode+");
-	} else if (!strcmp (packet, "QDmaTimeEnable")) {
-		printf("Enable dma debugging\n");
-		bool ret = reply_ok ();
-		debug_dma_frame = 1;
-		debug_dma = 2;
-		return ret;
 	} else {
 		printf("handle_query_packet %d\n", __LINE__);
 		send_packet_string ("");
@@ -1093,9 +788,9 @@ static void resolve_breakpoint_seg_offset (Breakpoint* breakpoint)
 
     if (seg_id >= s_segment_count)
     {
-        printf("Segment id >= segment_count (%d - %d)\n", seg_id, s_segment_count);
-        breakpoint->needs_resolve = true;
-        return;
+		printf("Segment id >= segment_count (%d - %d)\n", seg_id, s_segment_count);
+		breakpoint->needs_resolve = true;
+		return;
     }
 
     breakpoint->address = s_segment_info[seg_id].address + seg_address;
@@ -1110,14 +805,14 @@ static bool set_offset_seg_breakpoint (uaecptr address, uae_u32 segment_id, int 
 
     if (!add)
     {
-        for (int i = 0; i < s_breakpoint_count; ++i)
-        {
-            if (s_breakpoints[i].seg_address == address && s_breakpoints[i].seg_id == segment_id) {
-                s_breakpoints[i] = s_breakpoints[s_breakpoint_count - 1];
-                s_breakpoint_count--;
-                return reply_ok ();
-            }
-        }
+		for (int i = 0; i < s_breakpoint_count; ++i)
+		{
+			if (s_breakpoints[i].seg_address == address && s_breakpoints[i].seg_id == segment_id) {
+			s_breakpoints[i] = s_breakpoints[s_breakpoint_count - 1];
+			s_breakpoint_count--;
+			return reply_ok ();
+			}
+		}
     }
 
 	s_breakpoints[s_breakpoint_count].seg_address = address;
@@ -1146,7 +841,7 @@ static bool set_breakpoint_address (char* packet, int add)
 	if (scan_res == 2)
 	{
 	    printf("offset 0x%x seg_id %d\n", address, segment);
-        return set_offset_seg_breakpoint (address, segment, add);
+	return set_offset_seg_breakpoint (address, segment, add);
 	}
 
 	if (scan_res != 1)
@@ -1265,12 +960,14 @@ static bool parse_packet(char* packet, int size)
 
 	printf("parsing packet %s\n", packet);
 
+	/*
 	if (*packet == '-' && size == 1)
 	{
 		printf("*** Resending\n");
 		rconn_send (s_conn, s_lastSent, s_lastSize, 0);
 		return true;
 	}
+	*/
 
 	// TODO: Do we need to handle data that strides several packtes?
 
@@ -1384,7 +1081,6 @@ static void remote_debug_ (void)
 			uae_u32 seg_end = seg->address + seg->size;
 
 			if (pc >= seg_start && pc < seg_end) {
-				//send_exception ();
 				printf("switching to tracing\n");
 				s_state = Tracing;
 				break;
@@ -1447,18 +1143,6 @@ static void remote_debug_ (void)
 
 static void remote_debug_update_ (void)
 {
-	/*
-	static int counter = 0;
-	counter++;
-	//printf("counter %d\n", counter++);
-	if (counter == 1000) {
-		printf("activate debug_dma\n");
-		debug_dma = 2;
-	}
-	*/
-
-	//debug_dma = 2;
-
 	if (!s_conn)
 		return;
 
@@ -1472,165 +1156,6 @@ static void remote_debug_update_ (void)
 	}
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static void rec_dma_event (int evt, int hpos, int vpos)
-{
-	if (!dma_record[0])
-		return;
-
-	if (hpos >= NR_DMA_REC_HPOS || vpos >= NR_DMA_REC_VPOS)
-		return;
-
-	dma_rec* dr = &dma_record[dma_record_toggle][vpos * NR_DMA_REC_HPOS + hpos];
-	dr->evt |= evt;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-static void rec_dma_reset (void)
-{
-	if (!dma_record[0])
-		return;
-
-	dma_record_toggle ^= 1;
-
-	int t = dma_record_toggle;
-
-	if (debug_dma_frame) {
-		if (dma_max_sizes[t][0] != 0) { // make sure we have valid data before sending it
-			uae_u8* buffer = (uae_u8*)dma_info_rec[t];
-			uae_u8* store = buffer;
-
-			uae_u16 line = dma_max_sizes[t][0];
-			uae_u16 hcount = dma_max_sizes[t][1];
-
-			buffer = write_string(buffer, "$QDmaFrame:");
-			buffer = write_u16(buffer, hcount);
-			buffer = write_u16(buffer, line);
-
-			for (int y = 0; y < line; y++) {
-				for (int x = 0; x < hcount; x++) {
-					dma_rec* dr = &dma_record[t][y * NR_DMA_REC_HPOS + x];
-					buffer = write_u8(buffer, (uae_u8)dr->evt);
-					buffer = write_u8(buffer, (uae_u8)dr->type);
-				}
-			}
-
-			int len = (int)((uintptr_t)buffer - (uintptr_t)store);
-
-			send_packet_in_place(store, len);
-		}
-	}
-
-	dma_max_sizes[dma_record_toggle][0] = 0;
-	dma_max_sizes[dma_record_toggle][1] = 0;
-
-	dma_rec* dr = dma_record[dma_record_toggle];
-	for (int v = 0; v < NR_DMA_REC_VPOS; v++) {
-		for (int h = 0; h < NR_DMA_REC_HPOS; h++) {
-			dma_rec* dr2 = &dr[v * NR_DMA_REC_HPOS + h];
-			memset (dr2, 0, sizeof (struct dma_rec));
-			dr2->reg = 0xffff;
-			dr2->addr = 0xffffffff;
-		}
-	}
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void draw_cycles (int line, int width, int height)
-{
-	if (!dma_record[0]) {
-		return;
-	}
-
-	int y = line;
-
-	if (y < 0)
-		return;
-	if (y > maxvpos)
-		return;
-	if (y >= height)
-		return;
-
-	int t = dma_record_toggle ^ 1;
-
-	// only track stuff and send later
-
-	if (debug_dma_frame) {
-		if (line > dma_max_sizes[t][0])
-			dma_max_sizes[t][0] = line;
-
-		if (maxhpos > dma_max_sizes[t][1])
-			dma_max_sizes[t][1] = maxhpos;
-
-		return;
-	}
-
-	uae_u8 temp[(NR_DMA_REC_HPOS * sizeof(dma_rec) * 2) + 256] = { 0 };
-	uae_u8* buffer = temp;
-
-	const int tag_size = 10;
-
-	memcpy(buffer, "$QDmaTime:", tag_size);
-	buffer += tag_size;
-
-	//*buffer++ = '$';
-
-	buffer = write_u16(buffer, line);
-	buffer = write_u16(buffer, maxhpos);
-
-	for (int x = 0; x < maxhpos; x++) {
-		dma_rec* dr = &dma_record[t][y * NR_DMA_REC_HPOS + x];
-		buffer = write_u16(buffer, dr->evt);
-		buffer = write_u16(buffer, dr->type);
-	}
-
-	int buffer_size = tag_size + 8 + (maxhpos * 8);
-
-	printf("buffer_size size to send (%d - %d) - %d\n", line, maxhpos, buffer_size);
-
-	// TODO: Handle error
-
-	(void)send_packet_in_place(temp, buffer_size - 1);
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr,
-								   int hpos, int vpos, int type)
-{
-	if (!dma_record[0]) {
-		dma_record[0] = xmalloc (struct dma_rec, NR_DMA_REC_HPOS * NR_DMA_REC_VPOS);
-		dma_record[1] = xmalloc (struct dma_rec, NR_DMA_REC_HPOS * NR_DMA_REC_VPOS);
-		dma_info_rec[0] = xmalloc (struct dma_info, (NR_DMA_REC_HPOS * (NR_DMA_REC_VPOS + 1) * 2)); // + 1 for extra dataO
-		dma_info_rec[1] = xmalloc (struct dma_info, (NR_DMA_REC_HPOS * (NR_DMA_REC_VPOS + 1) * 2)); // + 1 for extra data
-
-		dma_record_toggle = 0;
-		record_dma_reset ();
-	}
-
-	if (hpos >= NR_DMA_REC_HPOS || vpos >= NR_DMA_REC_VPOS)
-		return NULL;
-
-	dma_rec* dr = &dma_record[dma_record_toggle][vpos * NR_DMA_REC_HPOS + hpos];
-
-	if (dr->reg != 0xffff) {
-		write_log (_T("DMA conflict: v=%d h=%d OREG=%04X NREG=%04X\n"), vpos, hpos, dr->reg, reg);
-		return dr;
-	}
-
-	dr->reg = reg;
-	dr->dat = dat;
-	dr->addr = addr;
-	dr->type = type;
-	dr->intlev = regs.intmask;
-
-	return dr;
-}
-
 extern uaecptr get_base (const uae_char *name, int offset);
 
 // Called from debugger_helper. At this point CreateProcess has been called
@@ -1638,7 +1163,7 @@ extern uaecptr get_base (const uae_char *name, int offset);
 // that looks like this:
 //
 //    rc = RunCommand(seglist, stacksize, argptr, argsize)
-//    D0                D1         D2       D3      D4
+//    D0		D1	   D2	    D3	    D4
 //
 //    LONG RunCommand(BPTR, ULONG, STRPTR, ULONG)
 //
@@ -1666,13 +1191,13 @@ void remote_debug_start_executable (struct TrapContext *context)
 	segtracker_clear ();
 
     m68k_dreg (regs, 1) = filename;
-	CallLib (context, dosbase, -150 );
+	CallLib (context, dosbase, -150);
 
     uaecptr segs = m68k_dreg (regs, 0);
 
     if (segs == 0) {
-    	printf("Unable to load segs\n");
-    	return;
+		printf("Unable to load segs\n");
+		return;
 	}
 
 	char buffer[1024] = { 0 };
@@ -1708,9 +1233,9 @@ void remote_debug_start_executable (struct TrapContext *context)
 	    Breakpoint* bp = &s_breakpoints[i];
 
 	    if (!bp->needs_resolve)
-	        continue;
+			continue;
 
-        resolve_breakpoint_seg_offset (bp);
+		resolve_breakpoint_seg_offset (bp);
 	}
 
 	send_packet_string (buffer);
@@ -1743,11 +1268,6 @@ extern "C"
 void remote_debug_init (int time_out) { remote_debug_init_ (time_out); }
 void remote_debug (void) { remote_debug_ (); }
 void remote_debug_update (void) { remote_debug_update_ (); }
-void remote_record_dma_event (int evt, int hpos, int vpos) { rec_dma_event(evt, hpos, vpos); }
-void remote_record_dma_reset (void) { rec_dma_reset (); }
-void remote_debug_draw_cycles (int line, int width, int height) { draw_cycles(line, width, height); }
-struct dma_rec* remote_record_dma (uae_u16 reg, uae_u16 dat, uae_u32 addr,
-								   int hpos, int vpos, int type);
 int fs_emu_is_quitting();
 
 
