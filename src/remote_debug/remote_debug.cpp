@@ -64,8 +64,8 @@ extern int exception_debugging;
 extern int debugger_active;
 static rconn* s_conn = 0;
 
-extern int debug_illegal;
-extern uae_u64 debug_illegal_mask;
+//extern int debug_illegal;
+//extern uae_u64 debug_illegal_mask;
 
 extern void debugger_boot();
 
@@ -1125,12 +1125,14 @@ static void remote_debug_ (void)
 		}
 	}
 
+    /*
 	if (debugger_active == 1 && old_active_debugger == 0) {
         did_step_cpu = true;
         step_cpu = false;
         s_state = Tracing;
         old_active_debugger = 1;
     }
+    */
 
 	// Check if we hit some breakpoint and then switch to tracing if we do
 
@@ -1193,6 +1195,7 @@ static void remote_debug_update_ (void)
 	rconn_update_listner (s_conn);
 
 	remote_debug_ ();
+    activate_debugger ();
 
 	if (rconn_poll_read(s_conn)) {
 		activate_debugger ();
@@ -1220,10 +1223,10 @@ void remote_debug_start_executable (struct TrapContext *context)
 	uaecptr args = ds (_T(""));
 #endif
 
-	debug_illegal = 1;
+	//debug_illegal = 1;
 
 	// trap illegal
-	debug_illegal_mask = 1 << 4;
+	//debug_illegal_mask = 1 << 4;
 
 	// so this is a hack to say that we aren't running from cli
 
