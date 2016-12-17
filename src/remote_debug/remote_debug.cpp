@@ -37,6 +37,7 @@
 //
 // Send a full-frame worth of timing data
 
+#include "debug.h"
 #include "remote_debug.h"
 #ifdef REMOTE_DEBUGGER
 
@@ -59,6 +60,8 @@
 #include "execlib.h"
 #include "uae.h"
 
+extern int exception_debugging;
+extern int debugger_active;
 static rconn* s_conn = 0;
 
 extern int debug_illegal;
@@ -112,9 +115,24 @@ static unsigned int s_socket_update_count = 0;
 bool need_ack = true;
 
 extern "C" {
-    int fs_emu_is_quitting();
     int remote_debugging = 0;
 }
+
+
+// This handles the case that we need to check if the emulator is quiting as we can be inside a loop
+// and stepping. This works a bit different on FS-UAE and WinUAE so we handle it by having a diffrent impl for each emulator
+
+#ifdef FSUAE
+
+extern "C" int fs_emu_is_quitting();
+int is_quiting() { return fs_emu_is_quitting(); }
+
+#else
+
+extern int quit_program;
+int is_quiting() { return quit_program; }
+
+#endif
 
 #define DEBUG_LOG
 
@@ -1028,8 +1046,8 @@ static bool parse_packet(char* packet, int size)
 
 static void update_connection (void)
 {
-	if (fs_emu_is_quitting())
-		return;
+	if (is_quiting())
+	    return;
 
 	//printf("updating connection\n");
 
@@ -1145,7 +1163,7 @@ static void remote_debug_ (void)
 					break;
 				}
 
-				if (fs_emu_is_quitting())
+				if (is_quiting())
 				{
 					printf("request quit\n");
 					s_state = Running;
@@ -1194,8 +1212,13 @@ extern uaecptr get_base (const uae_char *name, int offset);
 //
 void remote_debug_start_executable (struct TrapContext *context)
 {
+#ifdef FSUAE
 	uaecptr filename = ds (s_exe_to_run);
 	uaecptr args = ds ("");
+#else
+	uaecptr filename = ds (_T(s_exe_to_run));
+	uaecptr args = ds (_T(""));
+#endif
 
 	debug_illegal = 1;
 
@@ -1206,7 +1229,7 @@ void remote_debug_start_executable (struct TrapContext *context)
 
 	m68k_areg (regs, 1) = 0;
 	uae_u32 curr_task = CallLib (context, get_long (4), -0x126); /* FindTask */
-	char* task_ptr = au((char*)get_real_address (get_long (curr_task)));
+	char* task_ptr = (char*)au((char*)get_real_address (get_long (curr_task)));
 
 	// Clear WB message
 	*((uae_u32*)(task_ptr + 0xac)) = 0;
@@ -1296,8 +1319,6 @@ extern "C"
 void remote_debug_init (int time_out) { remote_debug_init_ (time_out); }
 void remote_debug (void) { remote_debug_ (); }
 void remote_debug_update (void) { remote_debug_update_ (); }
-int fs_emu_is_quitting();
-
 
 }
 
