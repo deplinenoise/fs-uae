@@ -278,7 +278,11 @@ int rconn_send(rconn* conn, const void* buffer, int length, int flags)
         printf("\n");
 #endif
 
+#ifdef FSUAE
     if ((ret = (int)send(conn->socket, buffer, (size_t)length, flags)) != (int)length)
+#else
+    if ((ret = (int)send(conn->socket, (char*)buffer, (size_t)length, flags)) != (int)length)
+#endif
     {
         printf("disconnected because length doesn't match (expected %d but got %d)\n", length, ret);
         rconn_disconnect(conn);
